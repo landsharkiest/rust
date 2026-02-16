@@ -222,6 +222,35 @@ impl f64 {
         core::f64::math::mul_add(self, a, b)
     }
 
+    /// Computes `(self * a) + b` with nondeterministic rounding.
+    ///
+    /// This is similar to [`mul_add`](Self::mul_add), but the intermediate
+    /// result may be rounded differently depending on the implementation.
+    /// The operation is either executed as a single fused multiply-add
+    /// instruction, or as separate multiply and add instructions.
+    ///
+    /// The choice of which one is used is implementation-defined, and may
+    /// depend on optimization level and context, for example.
+    ///
+    /// [`mul_add`]: Self::mul_add
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(float_mul_add_relaxed)]
+    ///
+    /// let result = 1.0f64.mul_add_relaxed(2.0, 3.0);
+    /// assert_eq!(result, 5.0);
+    /// ```
+    #[rustc_allow_incoherent_impl]
+    #[doc(alias = "fmuladd")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[unstable(feature = "float_mul_add_relaxed", issue = "151770")]
+    #[inline]
+    pub fn mul_add_relaxed(self, a: f64, b: f64) -> f64 {
+        core::f64::math::mul_add_relaxed(self, a, b)
+    }
+
     /// Calculates Euclidean division, the matching method for `rem_euclid`.
     ///
     /// This computes the integer `n` such that

@@ -1686,6 +1686,37 @@ impl f128 {
         intrinsics::fmaf128(self, a, b)
     }
 
+    /// Computes `(x * y) + z` with nondeterministic rounding.
+    ///
+    /// This is similar to [`mul_add`](Self::mul_add), but the intermediate
+    /// result may be rounded differently depending on the implementation.
+    /// The operation is either executed as a single fused multiply-add
+    /// instruction, or as separate multiply and add instructions.
+    ///
+    /// The choice of which one is used is implementation-defined, and may
+    /// depend on optimization level and context, for example.
+    ///
+    /// This is the same operation as `intrinsics::fmuladdf128`, also known as
+    /// "non-deterministic" or "relaxed" FMA.
+    ///
+    /// [`mul_add`]: Self::mul_add
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(float_mul_add_relaxed)]
+    ///
+    /// let result = 1.0f128.mul_add_relaxed(2.0, 3.0);
+    /// assert_eq!(result, 5.0);
+    /// ```
+    #[inline]
+    #[doc(alias = "fmuladd")]
+    #[unstable(feature = "float_mul_add_relaxed", issue = "151770")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn mul_add_relaxed(self, multiplicand: f128, addend: f128) -> f128 {
+        intrinsics::fmuladdf128(self, multiplicand, addend)
+    }
+
     /// Calculates Euclidean division, the matching method for `rem_euclid`.
     ///
     /// This computes the integer `n` such that

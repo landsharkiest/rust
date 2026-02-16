@@ -1849,6 +1849,37 @@ pub mod math {
         intrinsics::fmaf32(x, y, z)
     }
 
+    /// Computes `(x * y) + z` with nondeterministic rounding.
+    ///
+    /// This is similar to [`mul_add`](Self::mul_add), but the intermediate
+    /// result may be rounded differently depending on the implementation.
+    /// The operation is either executed as a single fused multiply-add
+    /// instruction, or as separate multiply and add instructions.
+    ///
+    /// The choice of which one is used is implementation-defined, and may
+    /// depend on optimization level and context, for example.
+    ///
+    /// This is the same operation as `intrinsics::fmuladdf32`, also known as
+    /// "non-deterministic" or "relaxed" FMA.
+    ///
+    /// [`mul_add`]: Self::mul_add
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(float_mul_add_relaxed)]
+    ///
+    /// let result = 1.0f32.mul_add_relaxed(2.0, 3.0);
+    /// assert_eq!(result, 5.0);
+    /// ```
+    #[inline]
+    #[doc(alias = "fmuladd")]
+    #[unstable(feature = "float_mul_add_relaxed", issue = "151770")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn mul_add_relaxed(self, multiplicand: f32, addend: f32) -> f32 {
+        intrinsics::fmuladdf32(self, multiplicand, addend)
+    }
+
     /// Experimental version of `div_euclid` in `core`. See [`f32::div_euclid`] for details.
     ///
     /// # Examples
