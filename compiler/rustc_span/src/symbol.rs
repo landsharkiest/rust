@@ -3,7 +3,6 @@
 //! type, and vice versa.
 
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 use std::{fmt, str};
 
 use rustc_arena::DroplessArena;
@@ -158,6 +157,7 @@ symbols! {
         Abi,
         AcqRel,
         Acquire,
+        Alignment,
         Any,
         Arc,
         ArcWeak,
@@ -212,6 +212,7 @@ symbols! {
         CoercePointeeValidated,
         CoerceUnsized,
         Command,
+        Const,
         ConstParamTy,
         ConstParamTy_,
         Context,
@@ -235,6 +236,7 @@ symbols! {
         DynTrait,
         Encodable,
         Encoder,
+        Enum,
         Enumerate,
         Eq,
         Equal,
@@ -293,6 +295,7 @@ symbols! {
         IteratorMap,
         Layout,
         Left,
+        Lifetime,
         LinkedList,
         LintDiagnostic,
         LintPass,
@@ -373,8 +376,8 @@ symbols! {
         Stdin,
         Str,
         String,
+        Struct,
         StructuralPartialEq,
-        SubdiagMessage,
         Subdiagnostic,
         SymbolIntern,
         Sync,
@@ -396,6 +399,8 @@ symbols! {
         Ty,
         TyCtxt,
         TyKind,
+        Type,
+        Union,
         Unknown,
         Unsize,
         UnsizedConstParamTy,
@@ -578,6 +583,7 @@ symbols! {
         automatically_derived,
         available_externally,
         avr,
+        avr_target_feature,
         avx,
         avx10_target_feature,
         avx512_target_feature,
@@ -643,6 +649,7 @@ symbols! {
         caller_location,
         capture_disjoint_fields,
         carrying_mul_add,
+        carryless_mul,
         catch_unwind,
         cause,
         cdylib,
@@ -735,6 +742,7 @@ symbols! {
         const_allocate,
         const_async_blocks,
         const_block_items,
+        const_c_variadic,
         const_closures,
         const_compare_raw_pointers,
         const_constructor,
@@ -1003,6 +1011,7 @@ symbols! {
         explicit_tail_calls,
         export_name,
         export_stable,
+        export_symbols: "export-symbols",
         expr,
         expr_2021,
         expr_fragment_specifier_2024,
@@ -1085,6 +1094,7 @@ symbols! {
         ffi_returns_twice,
         field,
         field_init_shorthand,
+        fields,
         file,
         file_options,
         flags,
@@ -1140,6 +1150,7 @@ symbols! {
         from_output,
         from_residual,
         from_size_align_unchecked,
+        from_size_alignment_unchecked,
         from_str,
         from_str_method,
         from_str_nonconst,
@@ -1173,6 +1184,7 @@ symbols! {
         generic_const_parameter_types,
         generic_param_attrs,
         generic_pattern_types,
+        generics,
         get_context,
         global_alloc_ty,
         global_allocator,
@@ -1452,6 +1464,7 @@ symbols! {
         meta,
         meta_sized,
         metadata_type,
+        mgca_type_const_syntax,
         min_const_fn,
         min_const_generics,
         min_const_unsafe_fn,
@@ -1627,6 +1640,7 @@ symbols! {
         on_const,
         on_unimplemented,
         opaque,
+        opaque_generic_const_args,
         opaque_module_name_placeholder: "<opaque>",
         open_options_new,
         ops,
@@ -1956,7 +1970,6 @@ symbols! {
         rustc_deprecated_safe_2024,
         rustc_diagnostic_item,
         rustc_diagnostic_macros,
-        rustc_dirty,
         rustc_do_not_const_check,
         rustc_doc_primitive,
         rustc_driver,
@@ -1996,6 +2009,7 @@ symbols! {
         rustc_no_implicit_autorefs,
         rustc_no_implicit_bounds,
         rustc_no_mir_inline,
+        rustc_non_const_trait_method,
         rustc_nonnull_optimization_guaranteed,
         rustc_nounwind,
         rustc_objc_class,
@@ -2083,6 +2097,7 @@ symbols! {
         simd_bitmask,
         simd_bitreverse,
         simd_bswap,
+        simd_carryless_mul,
         simd_cast,
         simd_cast_ptr,
         simd_ceil,
@@ -2337,7 +2352,6 @@ symbols! {
         type_ascribe,
         type_ascription,
         type_changing_struct_update,
-        type_const,
         type_id,
         type_id_eq,
         type_info,
@@ -2472,6 +2486,7 @@ symbols! {
         values,
         var,
         variant_count,
+        variants,
         vec,
         vec_as_mut_slice,
         vec_as_slice,
@@ -2753,7 +2768,7 @@ impl fmt::Display for IdentPrinter {
     }
 }
 
-/// An newtype around `Ident` that calls [Ident::normalize_to_macro_rules] on
+/// A newtype around `Ident` that calls [Ident::normalize_to_macro_rules] on
 /// construction for "local variable hygiene" comparisons.
 ///
 /// Use this type when you need to compare identifiers according to macro_rules hygiene.
@@ -2777,48 +2792,6 @@ impl fmt::Debug for MacroRulesNormalizedIdent {
 impl fmt::Display for MacroRulesNormalizedIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
-    }
-}
-
-/// An newtype around `Ident` that calls [Ident::normalize_to_macros_2_0] on
-/// construction for "item hygiene" comparisons.
-///
-/// Identifiers with same string value become same if they came from the same macro 2.0 macro
-/// (e.g., `macro` item, but not `macro_rules` item) and stay different if they came from
-/// different macro 2.0 macros.
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub struct Macros20NormalizedIdent(pub Ident);
-
-impl Macros20NormalizedIdent {
-    #[inline]
-    pub fn new(ident: Ident) -> Self {
-        Macros20NormalizedIdent(ident.normalize_to_macros_2_0())
-    }
-
-    // dummy_span does not need to be normalized, so we can use `Ident` directly
-    pub fn with_dummy_span(name: Symbol) -> Self {
-        Macros20NormalizedIdent(Ident::with_dummy_span(name))
-    }
-}
-
-impl fmt::Debug for Macros20NormalizedIdent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-impl fmt::Display for Macros20NormalizedIdent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-/// By impl Deref, we can access the wrapped Ident as if it were a normal Ident
-/// such as `norm_ident.name` instead of `norm_ident.0.name`.
-impl Deref for Macros20NormalizedIdent {
-    type Target = Ident;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

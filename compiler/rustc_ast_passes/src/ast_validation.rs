@@ -698,13 +698,11 @@ impl<'a> AstValidator<'a> {
             unreachable!("C variable argument list cannot be used in closures")
         };
 
-        // C-variadics are not yet implemented in const evaluation.
-        if let Const::Yes(const_span) = sig.header.constness {
-            self.dcx().emit_err(errors::ConstAndCVariadic {
-                spans: vec![const_span, variadic_param.span],
-                const_span,
-                variadic_span: variadic_param.span,
-            });
+        if let Const::Yes(_) = sig.header.constness
+            && !self.features.enabled(sym::const_c_variadic)
+        {
+            let msg = format!("c-variadic const function definitions are unstable");
+            feature_err(&self.sess, sym::const_c_variadic, sig.span, msg).emit();
         }
 
         if let Some(coroutine_kind) = sig.header.coroutine_kind {
@@ -1361,9 +1359,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     }
                 });
             }
-            ItemKind::Const(box ConstItem { defaultness, ident, rhs, .. }) => {
+            ItemKind::Const(box ConstItem { defaultness, ident, rhs_kind, .. }) => {
                 self.check_defaultness(item.span, *defaultness);
-                if rhs.is_none() {
+                if !rhs_kind.has_expr() {
                     self.dcx().emit_err(errors::ConstWithoutBody {
                         span: item.span,
                         replace_span: self.ending_semi_or_hi(item.span),
@@ -1715,11 +1713,13 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
 
         if let AssocCtxt::Impl { .. } = ctxt {
             match &item.kind {
-                AssocItemKind::Const(box ConstItem { rhs: None, .. }) => {
-                    self.dcx().emit_err(errors::AssocConstWithoutBody {
-                        span: item.span,
-                        replace_span: self.ending_semi_or_hi(item.span),
-                    });
+                AssocItemKind::Const(box ConstItem { rhs_kind, .. }) => {
+                    if !rhs_kind.has_expr() {
+                        self.dcx().emit_err(errors::AssocConstWithoutBody {
+                            span: item.span,
+                            replace_span: self.ending_semi_or_hi(item.span),
+                        });
+                    }
                 }
                 AssocItemKind::Fn(box Fn { body, .. }) => {
                     if body.is_none() && !self.is_sdylib_interface {
