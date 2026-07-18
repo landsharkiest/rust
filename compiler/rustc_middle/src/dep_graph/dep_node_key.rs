@@ -1,15 +1,60 @@
+use std::fmt::Debug;
+
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModDefId, ModDefId};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModId, ModId};
 use rustc_hir::definitions::DefPathHash;
 use rustc_hir::{HirId, ItemLocalId, OwnerId};
 
-use crate::dep_graph::{DepNode, DepNodeKey, FingerprintStyle};
+use crate::dep_graph::{DepNode, KeyFingerprintStyle};
 use crate::ty::TyCtxt;
+
+/// Trait for query keys as seen by dependency-node tracking.
+pub trait DepNodeKey<'tcx>: Debug + Sized {
+    fn key_fingerprint_style() -> KeyFingerprintStyle;
+
+    /// This method turns a query key into an opaque `Fingerprint` to be used
+    /// in `DepNode`.
+    fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint;
+
+    /// This method tries to recover the query key from the given `DepNode`,
+    /// something which is needed when forcing `DepNode`s during red-green
+    /// evaluation. The query system will only call this method if
+    /// `fingerprint_style()` is not `FingerprintStyle::Opaque`.
+    /// It is always valid to return `None` here, in which case incremental
+    /// compilation will treat the query as having changed instead of forcing it.
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self>;
+}
+
+// Blanket impl of `DepNodeKey`, which is specialized by other impls elsewhere.
+impl<'tcx, T> DepNodeKey<'tcx> for T
+where
+    T: StableHash + Debug,
+{
+    #[inline(always)]
+    default fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::Opaque
+    }
+
+    #[inline(always)]
+    default fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint {
+        tcx.with_stable_hashing_context(|mut hcx| {
+            let mut hasher = StableHasher::new();
+            self.stable_hash(&mut hcx, &mut hasher);
+            hasher.finish()
+        })
+    }
+
+    #[inline(always)]
+    default fn try_recover_key(_: TyCtxt<'tcx>, _: &DepNode) -> Option<Self> {
+        None
+    }
+}
 
 impl<'tcx> DepNodeKey<'tcx> for () {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::Unit
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::Unit
     }
 
     #[inline(always)]
@@ -18,15 +63,15 @@ impl<'tcx> DepNodeKey<'tcx> for () {
     }
 
     #[inline(always)]
-    fn recover(_: TyCtxt<'tcx>, _: &DepNode) -> Option<Self> {
+    fn try_recover_key(_: TyCtxt<'tcx>, _: &DepNode) -> Option<Self> {
         Some(())
     }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for DefId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -35,20 +80,15 @@ impl<'tcx> DepNodeKey<'tcx> for DefId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        tcx.def_path_str(*self)
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
         dep_node.extract_def_id(tcx)
     }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for LocalDefId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -57,20 +97,15 @@ impl<'tcx> DepNodeKey<'tcx> for LocalDefId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        self.to_def_id().to_debug_str(tcx)
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
         dep_node.extract_def_id(tcx).map(|id| id.expect_local())
     }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for OwnerId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -79,20 +114,15 @@ impl<'tcx> DepNodeKey<'tcx> for OwnerId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        self.to_def_id().to_debug_str(tcx)
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
         dep_node.extract_def_id(tcx).map(|id| OwnerId { def_id: id.expect_local() })
     }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for CrateNum {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -102,20 +132,15 @@ impl<'tcx> DepNodeKey<'tcx> for CrateNum {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        tcx.crate_name(*self).to_string()
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
         dep_node.extract_def_id(tcx).map(|id| id.krate)
     }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for (DefId, DefId) {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::Opaque
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::Opaque
     }
 
     // We actually would not need to specialize the implementation of this
@@ -130,19 +155,12 @@ impl<'tcx> DepNodeKey<'tcx> for (DefId, DefId) {
 
         def_path_hash_0.0.combine(def_path_hash_1.0)
     }
-
-    #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        let (def_id_0, def_id_1) = *self;
-
-        format!("({}, {})", tcx.def_path_debug_str(def_id_0), tcx.def_path_debug_str(def_id_1))
-    }
 }
 
 impl<'tcx> DepNodeKey<'tcx> for HirId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::HirId
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::HirId
     }
 
     // We actually would not need to specialize the implementation of this
@@ -160,15 +178,9 @@ impl<'tcx> DepNodeKey<'tcx> for HirId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        let HirId { owner, local_id } = *self;
-        format!("{}.{}", tcx.def_path_str(owner), local_id.as_u32())
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
-        if tcx.fingerprint_style(dep_node.kind) == FingerprintStyle::HirId {
-            let (local_hash, local_id) = Fingerprint::from(dep_node.hash).split();
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+        if tcx.key_fingerprint_style(dep_node.kind) == KeyFingerprintStyle::HirId {
+            let (local_hash, local_id) = Fingerprint::from(dep_node.key_fingerprint).split();
             let def_path_hash = DefPathHash::new(tcx.stable_crate_id(LOCAL_CRATE), local_hash);
             let def_id = tcx.def_path_hash_to_def_id(def_path_hash)?.expect_local();
             let local_id = local_id
@@ -182,10 +194,10 @@ impl<'tcx> DepNodeKey<'tcx> for HirId {
     }
 }
 
-impl<'tcx> DepNodeKey<'tcx> for ModDefId {
+impl<'tcx> DepNodeKey<'tcx> for ModId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -194,20 +206,15 @@ impl<'tcx> DepNodeKey<'tcx> for ModDefId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        self.to_def_id().to_debug_str(tcx)
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
-        DefId::recover(tcx, dep_node).map(ModDefId::new_unchecked)
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+        DefId::try_recover_key(tcx, dep_node).map(ModId::new_unchecked)
     }
 }
 
-impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
+impl<'tcx> DepNodeKey<'tcx> for LocalModId {
     #[inline(always)]
-    fn fingerprint_style() -> FingerprintStyle {
-        FingerprintStyle::DefPathHash
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::DefPathHash
     }
 
     #[inline(always)]
@@ -216,12 +223,7 @@ impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
     }
 
     #[inline(always)]
-    fn to_debug_str(&self, tcx: TyCtxt<'tcx>) -> String {
-        self.to_def_id().to_debug_str(tcx)
-    }
-
-    #[inline(always)]
-    fn recover(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
-        LocalDefId::recover(tcx, dep_node).map(LocalModDefId::new_unchecked)
+    fn try_recover_key(tcx: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+        LocalDefId::try_recover_key(tcx, dep_node).map(LocalModId::new_unchecked)
     }
 }

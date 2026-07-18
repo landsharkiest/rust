@@ -2,12 +2,13 @@ use hir::{ExprKind, Node};
 use rustc_abi::{Integer, Size};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{DoubleS, HalfS, IeeeFloat, QuadS, Semantics, SingleS};
+use rustc_ast as ast;
+use rustc_hir as hir;
 use rustc_hir::{HirId, attrs};
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::{bug, ty};
 use rustc_span::{Span, Symbol};
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::LateContext;
 use crate::context::LintContext;
@@ -16,7 +17,7 @@ use crate::lints::{
     OverflowingBinHexSub, OverflowingInt, OverflowingIntHelp, OverflowingLiteral, OverflowingUInt,
     RangeEndpointOutOfRange, SurrogateCharCast, TooLargeCharCast, UseInclusiveRange,
 };
-use crate::types::{OVERFLOWING_LITERALS, TypeLimits};
+use crate::types::OVERFLOWING_LITERALS;
 
 /// Attempts to special-case the overflowing literal lint when it occurs as a range endpoint (`expr..MAX+1`).
 /// Returns `true` iff the lint was emitted.
@@ -157,8 +158,21 @@ fn report_bin_hex_error(
             (t.name_str(), actually.to_string())
         }
     };
-    let sign =
-        if negative { OverflowingBinHexSign::Negative } else { OverflowingBinHexSign::Positive };
+    let sign = if negative {
+        OverflowingBinHexSign::Negative {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    } else {
+        OverflowingBinHexSign::Positive {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    };
     let sub = get_type_suggestion(cx.typeck_results().node_type(hir_id), val, negative).map(
         |suggestion_ty| {
             if let Some(pos) = repr_str.chars().position(|c| c == 'i' || c == 'u') {
@@ -194,7 +208,7 @@ fn report_bin_hex_error(
             Some(OverflowingBinHexSignBitSub {
                 span,
                 lit_no_suffix,
-                negative_val: actually.clone(),
+                negative_val: actually,
                 int_ty: int_ty.name_str(),
                 uint_ty: Integer::fit_unsigned(val).uint_ty_str(),
             })
@@ -204,15 +218,7 @@ fn report_bin_hex_error(
     cx.emit_span_lint(
         OVERFLOWING_LITERALS,
         span,
-        OverflowingBinHex {
-            ty: t,
-            lit: repr_str.clone(),
-            dec: val,
-            actually,
-            sign,
-            sub,
-            sign_bit_sub,
-        },
+        OverflowingBinHex { ty: t, sign, sub, sign_bit_sub },
     )
 }
 
@@ -254,17 +260,17 @@ fn literal_to_i128(val: u128, negative: bool) -> Option<i128> {
 
 fn lint_int_literal<'tcx>(
     cx: &LateContext<'tcx>,
-    type_limits: &TypeLimits,
     hir_id: HirId,
     span: Span,
     lit: &hir::Lit,
     t: ty::IntTy,
     v: u128,
+    surrounding_negation: Option<Span>,
 ) {
     let int_type = t.normalize(cx.sess().target.pointer_width);
     let (min, max) = int_ty_range(int_type);
     let max = max as u128;
-    let negative = type_limits.negated_expr_id == Some(hir_id);
+    let negative = surrounding_negation.is_some();
 
     // Detect literal value out of range [min, max] inclusive
     // avoiding use of -min to prevent overflow/panic
@@ -288,7 +294,7 @@ fn lint_int_literal<'tcx>(
             return;
         }
 
-        let span = if negative { type_limits.negated_expr_span.unwrap() } else { span };
+        let span = surrounding_negation.unwrap_or(span);
         let lit = cx
             .sess()
             .source_map()
@@ -394,23 +400,22 @@ fn float_is_infinite<S: Semantics>(v: Symbol) -> Option<bool> {
 
 pub(crate) fn lint_literal<'tcx>(
     cx: &LateContext<'tcx>,
-    type_limits: &TypeLimits,
     hir_id: HirId,
     span: Span,
     lit: &hir::Lit,
-    negated: bool,
+    surrounding_negation: Option<Span>,
 ) {
     match *cx.typeck_results().node_type(hir_id).kind() {
         ty::Int(t) => {
             match lit.node {
                 ast::LitKind::Int(v, ast::LitIntType::Signed(_) | ast::LitIntType::Unsuffixed) => {
-                    lint_int_literal(cx, type_limits, hir_id, span, lit, t, v.get())
+                    lint_int_literal(cx, hir_id, span, lit, t, v.get(), surrounding_negation)
                 }
                 _ => bug!(),
             };
         }
         ty::Uint(t) => {
-            assert!(!negated);
+            assert!(surrounding_negation.is_none());
             lint_uint_literal(cx, hir_id, span, lit, t)
         }
         ty::Float(t) => {

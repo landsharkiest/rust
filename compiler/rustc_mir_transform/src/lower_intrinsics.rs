@@ -19,6 +19,7 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                 && let ty::FnDef(def_id, generic_args) = *func.ty(local_decls, tcx).kind()
                 && let Some(intrinsic) = tcx.intrinsic(def_id)
             {
+                let generic_args = generic_args.no_bound_vars().unwrap();
                 match intrinsic.name {
                     sym::unreachable => {
                         terminator.kind = TerminatorKind::Unreachable;
@@ -35,7 +36,7 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             terminator.source_info,
                             StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::Use(Operand::RuntimeChecks(op)),
+                                Rvalue::Use(Operand::RuntimeChecks(op), WithRetag::Yes),
                             ))),
                         ));
                         terminator.kind = TerminatorKind::Goto { target };
@@ -46,11 +47,14 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             terminator.source_info,
                             StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                                    span: terminator.source_info.span,
-                                    user_ty: None,
-                                    const_: Const::zero_sized(tcx.types.unit),
-                                }))),
+                                Rvalue::Use(
+                                    Operand::Constant(Box::new(ConstOperand {
+                                        span: terminator.source_info.span,
+                                        user_ty: None,
+                                        const_: Const::zero_sized(tcx.types.unit),
+                                    })),
+                                    WithRetag::Yes,
+                                ),
                             ))),
                         ));
                         terminator.kind = TerminatorKind::Goto { target };
@@ -165,7 +169,7 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             terminator.source_info,
                             StatementKind::Assign(Box::new((
                                 *destination,
-                                Rvalue::Use(Operand::Copy(derefed_place)),
+                                Rvalue::Use(Operand::Copy(derefed_place), WithRetag::Yes),
                             ))),
                         ));
                         terminator.kind = match *target {
@@ -177,30 +181,7 @@ impl<'tcx> crate::MirPass<'tcx> for LowerIntrinsics {
                             Some(target) => TerminatorKind::Goto { target },
                         }
                     }
-                    sym::write_via_move => {
-                        let target = target.unwrap();
-                        let Ok([ptr, val]) = take_array(args) else {
-                            span_bug!(
-                                terminator.source_info.span,
-                                "Wrong number of arguments for write_via_move intrinsic",
-                            );
-                        };
-                        let derefed_place = if let Some(place) = ptr.node.place()
-                            && let Some(local) = place.as_local()
-                        {
-                            tcx.mk_place_deref(local.into())
-                        } else {
-                            span_bug!(
-                                terminator.source_info.span,
-                                "Only passing a local is supported"
-                            );
-                        };
-                        block.statements.push(Statement::new(
-                            terminator.source_info,
-                            StatementKind::Assign(Box::new((derefed_place, Rvalue::Use(val.node)))),
-                        ));
-                        terminator.kind = TerminatorKind::Goto { target };
-                    }
+                    // `write_via_move` is already lowered during MIR building.
                     sym::discriminant_value => {
                         let target = target.unwrap();
                         let Ok([arg]) = take_array(args) else {

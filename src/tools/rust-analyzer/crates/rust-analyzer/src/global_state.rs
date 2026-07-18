@@ -14,11 +14,11 @@ use hir::ChangeWithProcMacros;
 use ide::{Analysis, AnalysisHost, Cancellable, FileId, SourceRootId};
 use ide_db::{
     MiniCore,
-    base_db::{Crate, ProcMacroPaths, SourceDatabase, salsa::CancellationToken, salsa::Revision},
+    base_db::{Crate, ProcMacroPaths, SourceDatabase, salsa::Revision},
 };
 use itertools::Itertools;
 use load_cargo::SourceRootConfig;
-use lsp_types::{SemanticTokens, Url};
+use lsp_types::{Notification, SemanticTokens, Uri};
 use parking_lot::{
     MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard,
     RwLockWriteGuard,
@@ -88,7 +88,6 @@ pub(crate) struct GlobalState {
     pub(crate) task_pool: Handle<TaskPool<Task>, Receiver<Task>>,
     pub(crate) fmt_pool: Handle<TaskPool<Task>, Receiver<Task>>,
     pub(crate) cancellation_pool: thread::Pool,
-    pub(crate) cancellation_tokens: FxHashMap<lsp_server::RequestId, CancellationToken>,
 
     pub(crate) config: Arc<Config>,
     pub(crate) config_errors: Option<ConfigErrors>,
@@ -98,7 +97,7 @@ pub(crate) struct GlobalState {
     pub(crate) source_root_config: SourceRootConfig,
     /// A mapping that maps a local source root's `SourceRootId` to it parent's `SourceRootId`, if it has one.
     pub(crate) local_roots_parent_map: Arc<FxHashMap<SourceRootId, SourceRootId>>,
-    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
+    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
 
     // status
     pub(crate) shutdown_requested: bool,
@@ -210,7 +209,7 @@ pub(crate) struct GlobalStateSnapshot {
     pub(crate) analysis: Analysis,
     pub(crate) check_fixes: CheckFixes,
     mem_docs: MemDocs,
-    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
+    pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Uri, SemanticTokens>>>,
     vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
     // used to signal semantic highlighting to fall back to syntax based highlighting until
@@ -266,7 +265,6 @@ impl GlobalState {
             task_pool,
             fmt_pool,
             cancellation_pool,
-            cancellation_tokens: Default::default(),
             loader,
             config: Arc::new(config.clone()),
             analysis_host,
@@ -332,7 +330,7 @@ impl GlobalState {
         this
     }
 
-    pub(crate) fn process_changes(&mut self) -> bool {
+    pub(crate) fn process_changes(&mut self) -> (bool, Option<Duration>) {
         let _p = span!(Level::INFO, "GlobalState::process_changes").entered();
         // We cannot directly resolve a change in a ratoml file to a format
         // that can be used by the config module because config talks
@@ -345,7 +343,7 @@ impl GlobalState {
         let mut guard = self.vfs.write();
         let changed_files = guard.0.take_changes();
         if changed_files.is_empty() {
-            return false;
+            return (false, None);
         }
 
         let (change, modified_rust_files, workspace_structure_change) =
@@ -441,7 +439,7 @@ impl GlobalState {
                 (change, modified_rust_files, workspace_structure_change)
             });
 
-        self.analysis_host.apply_change(change);
+        let cancellation_time = self.analysis_host.apply_change(change);
 
         if !modified_ratoml_files.is_empty()
             || !self.config.same_source_root_parent_map(&self.local_roots_parent_map)
@@ -563,7 +561,7 @@ impl GlobalState {
             }
         }
 
-        true
+        (true, Some(cancellation_time))
     }
 
     pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
@@ -582,12 +580,12 @@ impl GlobalState {
         }
     }
 
-    pub(crate) fn send_request<R: lsp_types::request::Request>(
+    pub(crate) fn send_request<R: lsp_types::Request>(
         &mut self,
         params: R::Params,
         handler: ReqHandler,
     ) {
-        let request = self.req_queue.outgoing.register(R::METHOD.to_owned(), params, handler);
+        let request = self.req_queue.outgoing.register(R::METHOD.into(), params, handler);
         self.send(request.into());
     }
 
@@ -600,11 +598,8 @@ impl GlobalState {
         handler(self, response)
     }
 
-    pub(crate) fn send_notification<N: lsp_types::notification::Notification>(
-        &self,
-        params: N::Params,
-    ) {
-        let not = lsp_server::Notification::new(N::METHOD.to_owned(), params);
+    pub(crate) fn send_notification<N: lsp_types::Notification>(&self, params: N::Params) {
+        let not = lsp_server::Notification::new(N::METHOD.into(), params);
         self.send(not.into());
     }
 
@@ -619,7 +614,6 @@ impl GlobalState {
     }
 
     pub(crate) fn respond(&mut self, response: lsp_server::Response) {
-        self.cancellation_tokens.remove(&response.id);
         if let Some((method, start)) = self.req_queue.incoming.complete(&response.id) {
             if let Some(err) = &response.error
                 && err.message.starts_with("server panicked")
@@ -634,9 +628,6 @@ impl GlobalState {
     }
 
     pub(crate) fn cancel(&mut self, request_id: lsp_server::RequestId) {
-        if let Some(token) = self.cancellation_tokens.remove(&request_id) {
-            token.cancel();
-        }
         if let Some(response) = self.req_queue.incoming.cancel(request_id) {
             self.send(response.into());
         }
@@ -653,7 +644,7 @@ impl GlobalState {
 
     pub(crate) fn publish_diagnostics(
         &mut self,
-        uri: Url,
+        uri: Uri,
         version: Option<i32>,
         mut diagnostics: Vec<lsp_types::Diagnostic>,
     ) {
@@ -670,23 +661,34 @@ impl GlobalState {
 
                 // See https://github.com/rust-lang/rust-analyzer/issues/11404
                 // See https://github.com/rust-lang/rust-analyzer/issues/13130
-                let patch_empty = |message: &mut String| {
-                    if message.is_empty() {
-                        " ".clone_into(message);
+                let patch_empty = |message: &mut lsp_types::Message| match message {
+                    lsp_types::Message::String(m) if m.is_empty() => {
+                        " ".clone_into(m);
                     }
+                    lsp_types::Message::MarkupContent(lsp_types::MarkupContent {
+                        value,
+                        kind: _,
+                    }) if value.is_empty() => {
+                        " ".clone_into(value);
+                    }
+                    _ => {}
                 };
 
                 for d in &mut diagnostics {
                     patch_empty(&mut d.message);
                     if let Some(dri) = &mut d.related_information {
                         for dri in dri {
-                            patch_empty(&mut dri.message);
+                            // The LSP does not (yet?) specify that related diagnostic messages can
+                            // be in Markdown format (in addition to plain text).
+                            if dri.message.is_empty() {
+                                " ".clone_into(&mut dri.message);
+                            }
                         }
                     }
                 }
 
                 let not = lsp_server::Notification::new(
-                    <lsp_types::notification::PublishDiagnostics as lsp_types::notification::Notification>::METHOD.to_owned(),
+                    lsp_types::PublishDiagnosticsNotification::METHOD.into(),
                     lsp_types::PublishDiagnosticsParams { uri, diagnostics, version },
                 );
                 _ = sender.send(not.into());
@@ -750,11 +752,11 @@ impl GlobalStateSnapshot {
     }
 
     /// Returns `None` if the file was excluded.
-    pub(crate) fn url_to_file_id(&self, url: &Url) -> anyhow::Result<Option<FileId>> {
+    pub(crate) fn url_to_file_id(&self, url: &Uri) -> anyhow::Result<Option<FileId>> {
         url_to_file_id(&self.vfs_read(), url)
     }
 
-    pub(crate) fn file_id_to_url(&self, id: FileId) -> Url {
+    pub(crate) fn file_id_to_url(&self, id: FileId) -> Uri {
         file_id_to_url(&self.vfs_read(), id)
     }
 
@@ -774,12 +776,12 @@ impl GlobalStateSnapshot {
         Some(self.mem_docs.get(self.vfs_read().file_path(file_id))?.version)
     }
 
-    pub(crate) fn url_file_version(&self, url: &Url) -> Option<i32> {
+    pub(crate) fn url_file_version(&self, url: &Uri) -> Option<i32> {
         let path = from_proto::vfs_path(url).ok()?;
         Some(self.mem_docs.get(&path)?.version)
     }
 
-    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Url {
+    pub(crate) fn anchored_path(&self, path: &AnchoredPathBuf) -> Uri {
         let mut base = self.vfs_read().file_path(path.anchor).clone();
         base.pop();
         let path = base.join(&path.path).unwrap();
@@ -904,14 +906,14 @@ impl GlobalStateSnapshot {
     }
 }
 
-pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Url {
+pub(crate) fn file_id_to_url(vfs: &vfs::Vfs, id: FileId) -> Uri {
     let path = vfs.file_path(id);
     let path = path.as_path().unwrap();
     url_from_abs_path(path)
 }
 
 /// Returns `None` if the file was excluded.
-pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Url) -> anyhow::Result<Option<FileId>> {
+pub(crate) fn url_to_file_id(vfs: &vfs::Vfs, url: &Uri) -> anyhow::Result<Option<FileId>> {
     let path = from_proto::vfs_path(url)?;
     vfs_path_to_file_id(vfs, &path)
 }

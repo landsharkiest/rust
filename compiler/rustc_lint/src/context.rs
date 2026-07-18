@@ -6,54 +6,79 @@
 use std::cell::Cell;
 use std::slice;
 
+use rustc_abi as abi;
 use rustc_ast::BindingMode;
 use rustc_ast::util::parser::ExprPrecedence;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync;
 use rustc_data_structures::unord::UnordMap;
-use rustc_errors::{Diag, LintBuffer, LintDiagnostic, MultiSpan};
+use rustc_errors::{Diagnostic, LintBuffer, MultiSpan};
 use rustc_feature::Features;
+use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
 use rustc_hir::{Pat, PatKind};
 use rustc_middle::bug;
-use rustc_middle::lint::LevelAndSource;
+use rustc_middle::lint::{LevelSpec, StableLevelSpec, UnstableLevelSpec};
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
 use rustc_middle::ty::print::{PrintError, PrintTraitRefExt as _, Printer, with_no_trimmed_paths};
-use rustc_middle::ty::{self, GenericArg, RegisteredTools, Ty, TyCtxt, TypingEnv, TypingMode};
-use rustc_session::lint::{FutureIncompatibleInfo, Lint, LintExpectationId, LintId};
+use rustc_middle::ty::{
+    self, GenericArg, RegisteredTools, Ty, TyCtxt, TypingEnv, TypingMode, Unnormalized,
+};
+use rustc_session::lint::{
+    FutureIncompatibleInfo, Lint, LintExpectationId, LintId, StableLintExpectationId,
+    UnstableLintExpectationId,
+};
 use rustc_session::{DynLintStore, Session};
 use rustc_span::edit_distance::find_best_match_for_names;
 use rustc_span::{Ident, Span, Symbol, sym};
 use tracing::debug;
-use {rustc_abi as abi, rustc_hir as hir};
 
 use self::TargetLint::*;
 use crate::levels::LintLevelsBuilder;
 use crate::passes::{EarlyLintPassObject, LateLintPassObject};
 
-type EarlyLintPassFactory = dyn Fn() -> EarlyLintPassObject + sync::DynSend + sync::DynSync;
+pub(crate) type EarlyLintPassFactory =
+    Box<dyn Fn() -> EarlyLintPassObject + sync::DynSend + sync::DynSync>;
 type LateLintPassFactory =
-    dyn for<'tcx> Fn(TyCtxt<'tcx>) -> LateLintPassObject<'tcx> + sync::DynSend + sync::DynSync;
+    Box<dyn for<'tcx> Fn(TyCtxt<'tcx>) -> LateLintPassObject<'tcx> + sync::DynSend + sync::DynSync>;
 
 /// Information about the registered lints.
+//
+// About the pass factories: these should only be called once, but since we
+// want to avoid locks or interior mutability, we don't enforce this. Lints
+// should, in theory, be compatible with being constructed more than once,
+// though not necessarily in a sane manner. This is safe though.
 pub struct LintStore {
     /// Registered lints.
     lints: Vec<&'static Lint>,
 
-    /// Constructor functions for each variety of lint pass.
+    /// This lint pass kind is softly deprecated. It misses expanded code and has caused a few
+    /// errors in the past. Currently, it is only used in Clippy. New implementations
+    /// should avoid using this interface, as it might be removed in the future.
     ///
-    /// These should only be called once, but since we want to avoid locks or
-    /// interior mutability, we don't enforce this (and lints should, in theory,
-    /// be compatible with being constructed more than once, though not
-    /// necessarily in a sane manner. This is safe though.)
-    pub pre_expansion_passes: Vec<Box<EarlyLintPassFactory>>,
-    pub early_passes: Vec<Box<EarlyLintPassFactory>>,
-    pub late_passes: Vec<Box<LateLintPassFactory>>,
-    /// This is unique in that we construct them per-module, so not once.
-    pub late_module_passes: Vec<Box<LateLintPassFactory>>,
+    /// * See [rust#69838](https://github.com/rust-lang/rust/pull/69838)
+    /// * See [rust-clippy#5518](https://github.com/rust-lang/rust-clippy/pull/5518)
+    pub(crate) pre_expansion_lint_passes: Vec<EarlyLintPassFactory>,
+
+    /// These lint passes run on AST nodes.
+    pub(crate) early_lint_passes: Vec<EarlyLintPassFactory>,
+
+    /// These lint passes run on HIR nodes. Each one processes an entire crate. They don't benefit
+    /// from incremental compilation. `late_lint_mod_passes` should be used in preference where
+    /// possible; only use `late_lint_passes` for lints that implement `check_crate` and/or
+    /// `check_crate_post` and accumulate cross-module state.
+    ///
+    /// The exception is Clippy, which uses `late_lint_passes` for all late lint passes. It needs
+    /// `check_crate`/`check_crate_post` for some of its lints and uses late lint passes throughout
+    /// for consistency. This is ok because Clippy isn't wired for incremental compilation.
+    pub(crate) late_lint_passes: Vec<LateLintPassFactory>,
+
+    /// These lint passes run on HIR nodes, and are constructed per-module (i.e. multiple times).
+    /// They benefit from incremental compilation.
+    pub(crate) late_lint_mod_passes: Vec<LateLintPassFactory>,
 
     /// Lints indexed by name.
     by_name: UnordMap<String, TargetLint>,
@@ -129,10 +154,10 @@ impl LintStore {
     pub fn new() -> LintStore {
         LintStore {
             lints: vec![],
-            pre_expansion_passes: vec![],
-            early_passes: vec![],
-            late_passes: vec![],
-            late_module_passes: vec![],
+            pre_expansion_lint_passes: vec![],
+            early_lint_passes: vec![],
+            late_lint_passes: vec![],
+            late_lint_mod_passes: vec![],
             by_name: Default::default(),
             lint_groups: Default::default(),
         }
@@ -159,44 +184,24 @@ impl LintStore {
         self.lint_groups.keys().copied()
     }
 
-    pub fn register_early_pass(
-        &mut self,
-        pass: impl Fn() -> EarlyLintPassObject + 'static + sync::DynSend + sync::DynSync,
-    ) {
-        self.early_passes.push(Box::new(pass));
+    /// See the comment on `LintStore::pre_expansion_lint_passes`.
+    pub fn register_pre_expansion_lint_pass(&mut self, pass: EarlyLintPassFactory) {
+        self.pre_expansion_lint_passes.push(pass);
     }
 
-    /// This lint pass is softly deprecated. It misses expanded code and has caused a few
-    /// errors in the past. Currently, it is only used in Clippy. New implementations
-    /// should avoid using this interface, as it might be removed in the future.
-    ///
-    /// * See [rust#69838](https://github.com/rust-lang/rust/pull/69838)
-    /// * See [rust-clippy#5518](https://github.com/rust-lang/rust-clippy/pull/5518)
-    pub fn register_pre_expansion_pass(
-        &mut self,
-        pass: impl Fn() -> EarlyLintPassObject + 'static + sync::DynSend + sync::DynSync,
-    ) {
-        self.pre_expansion_passes.push(Box::new(pass));
+    /// See the comment on `LintStore::early_lint_passes`.
+    pub fn register_early_lint_pass(&mut self, pass: EarlyLintPassFactory) {
+        self.early_lint_passes.push(pass);
     }
 
-    pub fn register_late_pass(
-        &mut self,
-        pass: impl for<'tcx> Fn(TyCtxt<'tcx>) -> LateLintPassObject<'tcx>
-        + 'static
-        + sync::DynSend
-        + sync::DynSync,
-    ) {
-        self.late_passes.push(Box::new(pass));
+    /// See the comment on `LintStore::late_lint_passes`.
+    pub fn register_late_lint_pass(&mut self, pass: LateLintPassFactory) {
+        self.late_lint_passes.push(pass);
     }
 
-    pub fn register_late_mod_pass(
-        &mut self,
-        pass: impl for<'tcx> Fn(TyCtxt<'tcx>) -> LateLintPassObject<'tcx>
-        + 'static
-        + sync::DynSend
-        + sync::DynSync,
-    ) {
-        self.late_module_passes.push(Box::new(pass));
+    /// See the comment on `LintStore::late_lint_mod_passes`.
+    pub fn register_late_lint_mod_pass(&mut self, pass: LateLintPassFactory) {
+        self.late_lint_mod_passes.push(pass);
     }
 
     /// Helper method for register_early/late_pass
@@ -507,78 +512,37 @@ pub struct EarlyContext<'a> {
 }
 
 pub trait LintContext {
+    type LintExpectationId: Copy + Into<LintExpectationId>;
+
     fn sess(&self) -> &Session;
 
     // FIXME: These methods should not take an Into<MultiSpan> -- instead, callers should need to
     // set the span in their `decorate` function (preferably using set_span).
     /// Emit a lint at the appropriate level, with an optional associated span.
     ///
-    /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
+    /// [`emit_lint_base`]: rustc_middle::lint::emit_lint_base#decorate-signature
     #[track_caller]
     fn opt_span_lint<S: Into<MultiSpan>>(
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
+        decorate: impl for<'a> Diagnostic<'a, ()>,
     );
 
-    /// Emit a lint at `span` from a lint struct (some type that implements `LintDiagnostic`,
-    /// typically generated by `#[derive(LintDiagnostic)]`).
+    /// Emit a lint at `span` from a lint struct (some type that implements `Diagnostic`,
+    /// typically generated by `#[derive(Diagnostic)]`).
+    #[track_caller]
     fn emit_span_lint<S: Into<MultiSpan>>(
         &self,
         lint: &'static Lint,
         span: S,
-        decorator: impl for<'a> LintDiagnostic<'a, ()>,
+        decorator: impl for<'a> Diagnostic<'a, ()>,
     ) {
-        self.opt_span_lint(lint, Some(span), |lint| {
-            decorator.decorate_lint(lint);
-        });
+        self.opt_span_lint(lint, Some(span), decorator);
     }
 
-    /// Emit a lint at `span` from a lazily-constructed lint struct (some type that implements
-    /// `LintDiagnostic`, typically generated by `#[derive(LintDiagnostic)]`).
-    fn emit_span_lint_lazy<S: Into<MultiSpan>, L: for<'a> LintDiagnostic<'a, ()>>(
-        &self,
-        lint: &'static Lint,
-        span: S,
-        decorator: impl FnOnce() -> L,
-    ) {
-        self.opt_span_lint(lint, Some(span), |lint| {
-            let decorator = decorator();
-            decorator.decorate_lint(lint);
-        });
-    }
-
-    /// Emit a lint at the appropriate level, with an associated span.
-    ///
-    /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
-    #[track_caller]
-    fn span_lint<S: Into<MultiSpan>>(
-        &self,
-        lint: &'static Lint,
-        span: S,
-        decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
-    ) {
-        self.opt_span_lint(lint, Some(span), decorate);
-    }
-
-    /// Emit a lint from a lint struct (some type that implements `LintDiagnostic`, typically
-    /// generated by `#[derive(LintDiagnostic)]`).
-    fn emit_lint(&self, lint: &'static Lint, decorator: impl for<'a> LintDiagnostic<'a, ()>) {
-        self.opt_span_lint(lint, None as Option<Span>, |lint| {
-            decorator.decorate_lint(lint);
-        });
-    }
-
-    /// Emit a lint at the appropriate level, with no associated span.
-    ///
-    /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
-    fn lint(&self, lint: &'static Lint, decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>)) {
-        self.opt_span_lint(lint, None as Option<Span>, decorate);
-    }
-
-    /// This returns the lint level for the given lint at the current location.
-    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource;
+    /// This returns the lint level spec for the given lint at the current location.
+    fn get_lint_level_spec(&self, lint: &'static Lint) -> LevelSpec<Self::LintExpectationId>;
 
     /// This function can be used to manually fulfill an expectation. This can
     /// be used for lints which contain several spans, and should be suppressed,
@@ -587,7 +551,7 @@ pub trait LintContext {
     /// Note that this function should only be called for [`LintExpectationId`]s
     /// retrieved from the current lint pass. Buffered or manually created ids can
     /// cause ICEs.
-    fn fulfill_expectation(&self, expectation: LintExpectationId) {
+    fn fulfill_expectation(&self, expectation: Self::LintExpectationId) {
         // We need to make sure that submitted expectation ids are correctly fulfilled suppressed
         // and stored between compilation sessions. To not manually do these steps, we simply create
         // a dummy diagnostic and emit it as usual, which will be suppressed and stored like a
@@ -596,7 +560,7 @@ pub trait LintContext {
             .dcx()
             .struct_expect(
                 "this is a dummy diagnostic, to submit and store an expectation",
-                expectation,
+                expectation.into(),
             )
             .emit();
     }
@@ -625,6 +589,8 @@ impl<'a> EarlyContext<'a> {
 }
 
 impl<'tcx> LintContext for LateContext<'tcx> {
+    type LintExpectationId = StableLintExpectationId;
+
     /// Gets the overall compiler `Session` object.
     fn sess(&self) -> &Session {
         self.tcx.sess
@@ -634,22 +600,24 @@ impl<'tcx> LintContext for LateContext<'tcx> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
+        decorate: impl for<'a> Diagnostic<'a, ()>,
     ) {
         let hir_id = self.last_node_with_lint_attrs;
 
         match span {
-            Some(s) => self.tcx.node_span_lint(lint, hir_id, s, decorate),
-            None => self.tcx.node_lint(lint, hir_id, decorate),
+            Some(s) => self.tcx.emit_node_span_lint(lint, hir_id, s, decorate),
+            None => self.tcx.emit_node_lint(lint, hir_id, decorate),
         }
     }
 
-    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource {
-        self.tcx.lint_level_at_node(lint, self.last_node_with_lint_attrs)
+    fn get_lint_level_spec(&self, lint: &'static Lint) -> StableLevelSpec {
+        self.tcx.lint_level_spec_at_node(lint, self.last_node_with_lint_attrs)
     }
 }
 
 impl LintContext for EarlyContext<'_> {
+    type LintExpectationId = UnstableLintExpectationId;
+
     /// Gets the overall compiler `Session` object.
     fn sess(&self) -> &Session {
         self.builder.sess()
@@ -659,13 +627,13 @@ impl LintContext for EarlyContext<'_> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a, 'b> FnOnce(&'b mut Diag<'a, ()>),
+        decorator: impl for<'a> Diagnostic<'a, ()>,
     ) {
-        self.builder.opt_span_lint(lint, span.map(|s| s.into()), decorate)
+        self.builder.opt_span_lint(lint, span.map(|s| s.into()), decorator)
     }
 
-    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource {
-        self.builder.lint_level(lint)
+    fn get_lint_level_spec(&self, lint: &'static Lint) -> UnstableLevelSpec {
+        self.builder.lint_level_spec(lint)
     }
 }
 
@@ -673,13 +641,18 @@ impl<'tcx> LateContext<'tcx> {
     /// The typing mode of the currently visited node. Use this when
     /// building a new `InferCtxt`.
     pub fn typing_mode(&self) -> TypingMode<'tcx> {
-        // FIXME(#132279): In case we're in a body, we should use a typing
-        // mode which reveals the opaque types defined by that body.
-        TypingMode::non_body_analysis()
+        if let Some(body_id) = self.enclosing_body
+            && self.tcx.use_typing_mode_post_typeck_until_borrowck()
+        {
+            let def_id = self.tcx.hir_enclosing_body_owner(body_id.hir_id);
+            TypingMode::borrowck(self.tcx, def_id)
+        } else {
+            TypingMode::non_body_analysis()
+        }
     }
 
     pub fn typing_env(&self) -> TypingEnv<'tcx> {
-        TypingEnv { typing_mode: self.typing_mode(), param_env: self.param_env }
+        TypingEnv::new(self.param_env, self.typing_mode())
     }
 
     pub fn type_is_copy_modulo_regions(&self, ty: Ty<'tcx>) -> bool {
@@ -874,8 +847,9 @@ impl<'tcx> LateContext<'tcx> {
         tcx.associated_items(trait_id)
             .find_by_ident_and_kind(tcx, Ident::with_dummy_span(name), ty::AssocTag::Type, trait_id)
             .and_then(|assoc| {
-                let proj = Ty::new_projection(tcx, assoc.def_id, [self_ty]);
-                tcx.try_normalize_erasing_regions(self.typing_env(), proj).ok()
+                let proj = Ty::new_projection(tcx, ty::IsRigid::No, assoc.def_id, [self_ty]);
+                tcx.try_normalize_erasing_regions(self.typing_env(), Unnormalized::new_wip(proj))
+                    .ok()
             })
     }
 
@@ -884,12 +858,7 @@ impl<'tcx> LateContext<'tcx> {
     /// be used for pretty-printing HIR by rustc_hir_pretty.
     pub fn precedence(&self, expr: &hir::Expr<'_>) -> ExprPrecedence {
         let has_attr = |id: hir::HirId| -> bool {
-            for attr in self.tcx.hir_attrs(id) {
-                if attr.span().desugaring_kind().is_none() {
-                    return true;
-                }
-            }
-            false
+            self.tcx.hir_attrs(id).iter().any(hir::Attribute::is_prefix_attr_for_suggestions)
         };
         expr.precedence(&has_attr)
     }

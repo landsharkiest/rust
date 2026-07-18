@@ -23,7 +23,7 @@ use super::{
     AllowConstBlockItems, AttrWrapper, BlockMode, FnContext, FnParseMode, ForceCollect, Parser,
     Restrictions, SemiColonMode, Trailing, UsePreAttrPos,
 };
-use crate::errors::{self, MalformedLoopLabel};
+use crate::diagnostics::{self, MalformedLoopLabel};
 use crate::exp;
 
 impl<'a> Parser<'a> {
@@ -67,9 +67,9 @@ impl<'a> Parser<'a> {
         if self.token.is_keyword(kw::Mut) && self.is_keyword_ahead(1, &[kw::Let]) {
             self.bump();
             let mut_let_span = lo.to(self.token.span);
-            self.dcx().emit_err(errors::InvalidVariableDeclaration {
+            self.dcx().emit_err(diagnostics::InvalidVariableDeclaration {
                 span: mut_let_span,
-                sub: errors::InvalidVariableDeclarationSub::SwitchMutLetOrder(mut_let_span),
+                sub: diagnostics::InvalidVariableDeclarationSub::SwitchMutLetOrder(mut_let_span),
             });
         }
 
@@ -102,7 +102,7 @@ impl<'a> Parser<'a> {
             self.recover_stmt_local_after_let(
                 lo,
                 attrs,
-                errors::InvalidVariableDeclarationSub::MissingLet,
+                diagnostics::InvalidVariableDeclarationSub::MissingLet,
                 force_collect,
             )?
         } else if self.is_kw_followed_by_ident(kw::Auto) && self.may_recover() {
@@ -110,7 +110,7 @@ impl<'a> Parser<'a> {
             self.recover_stmt_local_after_let(
                 lo,
                 attrs,
-                errors::InvalidVariableDeclarationSub::UseLetNotAuto,
+                diagnostics::InvalidVariableDeclarationSub::UseLetNotAuto,
                 force_collect,
             )?
         } else if self.is_kw_followed_by_ident(sym::var) && self.may_recover() {
@@ -118,7 +118,7 @@ impl<'a> Parser<'a> {
             self.recover_stmt_local_after_let(
                 lo,
                 attrs,
-                errors::InvalidVariableDeclarationSub::UseLetNotVar,
+                diagnostics::InvalidVariableDeclarationSub::UseLetNotVar,
                 force_collect,
             )?
         } else if self.check_path()
@@ -181,7 +181,8 @@ impl<'a> Parser<'a> {
                 let bl = self.parse_block()?;
                 // Destructuring assignment ... else.
                 // This is not allowed, but point it out in a nice way.
-                self.dcx().emit_err(errors::AssignmentElseNotAllowed { span: e.span.to(bl.span) });
+                self.dcx()
+                    .emit_err(diagnostics::AssignmentElseNotAllowed { span: e.span.to(bl.span) });
             }
             self.mk_stmt(lo.to(e.span), StmtKind::Expr(e))
         } else {
@@ -276,12 +277,13 @@ impl<'a> Parser<'a> {
             && let attrs @ [.., last] = &*attrs.take_for_recovery(self.psess)
         {
             if last.is_doc_comment() {
-                self.dcx().emit_err(errors::DocCommentDoesNotDocumentAnything {
+                self.dcx().emit_err(diagnostics::DocCommentDoesNotDocumentAnything {
                     span: last.span,
                     missing_comma: None,
                 });
             } else if attrs.iter().any(|a| a.style == AttrStyle::Outer) {
-                self.dcx().emit_err(errors::ExpectedStatementAfterOuterAttr { span: last.span });
+                self.dcx()
+                    .emit_err(diagnostics::ExpectedStatementAfterOuterAttr { span: last.span });
             }
         }
     }
@@ -290,7 +292,7 @@ impl<'a> Parser<'a> {
         &mut self,
         lo: Span,
         attrs: AttrWrapper,
-        subdiagnostic: fn(Span) -> errors::InvalidVariableDeclarationSub,
+        subdiagnostic: fn(Span) -> diagnostics::InvalidVariableDeclarationSub,
         force_collect: ForceCollect,
     ) -> PResult<'a, Stmt> {
         let stmt = self.collect_tokens(None, attrs, force_collect, |this, attrs| {
@@ -303,7 +305,7 @@ impl<'a> Parser<'a> {
             ))
         })?;
         self.dcx()
-            .emit_err(errors::InvalidVariableDeclaration { span: lo, sub: subdiagnostic(lo) });
+            .emit_err(diagnostics::InvalidVariableDeclaration { span: lo, sub: subdiagnostic(lo) });
         Ok(stmt)
     }
 
@@ -312,7 +314,8 @@ impl<'a> Parser<'a> {
         let lo = super_.unwrap_or(self.prev_token.span);
 
         if self.token.is_keyword(kw::Const) && self.look_ahead(1, |t| t.is_ident()) {
-            self.dcx().emit_err(errors::ConstLetMutuallyExclusive { span: lo.to(self.token.span) });
+            self.dcx()
+                .emit_err(diagnostics::ConstLetMutuallyExclusive { span: lo.to(self.token.span) });
             self.bump();
         }
 
@@ -362,7 +365,7 @@ impl<'a> Parser<'a> {
                 // init parsed, ty error
                 // Could parse the type as if it were the initializer, it is likely there was a
                 // typo in the code: `:` instead of `=`. Add suggestion and emit the error.
-                err.span_suggestion_short(
+                err.span_suggestion_verbose(
                     colon_sp,
                     "use `=` if you meant to assign",
                     " =",
@@ -426,10 +429,10 @@ impl<'a> Parser<'a> {
     fn check_let_else_init_bool_expr(&self, init: &ast::Expr) {
         if let ast::ExprKind::Binary(op, ..) = init.kind {
             if op.node.is_lazy() {
-                self.dcx().emit_err(errors::InvalidExpressionInLetElse {
+                self.dcx().emit_err(diagnostics::InvalidExpressionInLetElse {
                     span: init.span,
                     operator: op.node.as_str(),
-                    sugg: errors::WrapInParentheses::Expression {
+                    sugg: diagnostics::WrapInParentheses::Expression {
                         left: init.span.shrink_to_lo(),
                         right: init.span.shrink_to_hi(),
                     },
@@ -443,20 +446,20 @@ impl<'a> Parser<'a> {
             let (span, sugg) = match trailing {
                 TrailingBrace::MacCall(mac) => (
                     mac.span(),
-                    errors::WrapInParentheses::MacroArgs {
+                    diagnostics::WrapInParentheses::MacroArgs {
                         left: mac.args.dspan.open,
                         right: mac.args.dspan.close,
                     },
                 ),
                 TrailingBrace::Expr(expr) => (
                     expr.span,
-                    errors::WrapInParentheses::Expression {
+                    diagnostics::WrapInParentheses::Expression {
                         left: expr.span.shrink_to_lo(),
                         right: expr.span.shrink_to_hi(),
                     },
                 ),
             };
-            self.dcx().emit_err(errors::InvalidCurlyInLetElse {
+            self.dcx().emit_err(diagnostics::InvalidCurlyInLetElse {
                 span: span.with_lo(span.hi() - BytePos(1)),
                 sugg,
             });
@@ -481,7 +484,7 @@ impl<'a> Parser<'a> {
                 // `➖` is a U+2796 Heavy Minus Sign Unicode Character) that was recovered as a
                 // `-=`.
                 let extra_op_span = self.psess.source_map().start_point(self.token.span);
-                self.dcx().emit_err(errors::CompoundAssignmentExpressionInLet {
+                self.dcx().emit_err(diagnostics::CompoundAssignmentExpressionInLet {
                     span: self.token.span,
                     suggestion: extra_op_span,
                 });
@@ -924,6 +927,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn try_recover_let_missing_semi(&mut self, local: &mut Local) -> Option<ErrorGuaranteed> {
+        let expr = match &mut local.kind {
+            LocalKind::Init(expr) | LocalKind::InitElse(expr, _) => expr,
+            LocalKind::Decl => return None,
+        };
+        if let Some((span, guar)) =
+            self.missing_semi_from_binop("`let` binding", expr, Some(local.span.shrink_to_lo()))
+        {
+            self.fn_body_missing_semi_guar = Some(guar);
+            *expr = self.mk_expr(span, ExprKind::Err(guar));
+            return Some(guar);
+        }
+        None
+    }
+
     /// Parses a statement, including the trailing semicolon.
     pub fn parse_full_stmt(
         &mut self,
@@ -1066,71 +1084,74 @@ impl<'a> Parser<'a> {
                 }
             }
             StmtKind::Expr(_) | StmtKind::MacCall(_) => {}
-            StmtKind::Let(local) if let Err(mut e) = self.expect_semi() => {
-                // We might be at the `,` in `let x = foo<bar, baz>;`. Try to recover.
-                match &mut local.kind {
-                    LocalKind::Init(expr) | LocalKind::InitElse(expr, _) => {
-                        self.check_mistyped_turbofish_with_multiple_type_params(e, expr).map_err(
-                            |mut e| {
-                                self.recover_missing_dot(&mut e);
-                                self.recover_missing_let_else(&mut e, &local.pat, stmt.span);
-                                e
-                            },
-                        )?;
-                        // We found `foo<bar, baz>`, have we fully recovered?
-                        self.expect_semi()?;
-                    }
-                    LocalKind::Decl => {
-                        if let Some(colon_sp) = local.colon_sp {
-                            e.span_label(
-                                colon_sp,
-                                format!(
-                                    "while parsing the type for {}",
-                                    local.pat.descr().map_or_else(
-                                        || "the binding".to_string(),
-                                        |n| format!("`{n}`")
-                                    )
-                                ),
-                            );
-                            let suggest_eq = if self.token == token::Dot
-                                && let _ = self.bump()
-                                && let mut snapshot = self.create_snapshot_for_diagnostic()
-                                && let Ok(_) = snapshot
-                                    .parse_dot_suffix_expr(
-                                        colon_sp,
-                                        self.mk_expr_err(
-                                            colon_sp,
-                                            self.dcx()
-                                                .delayed_bug("error during `:` -> `=` recovery"),
-                                        ),
-                                    )
-                                    .map_err(Diag::cancel)
-                            {
-                                true
-                            } else if let Some(op) = self.check_assoc_op()
-                                && op.node.can_continue_expr_unambiguously()
-                            {
-                                true
-                            } else {
-                                false
-                            };
-                            if suggest_eq {
-                                e.span_suggestion_short(
-                                    colon_sp,
-                                    "use `=` if you meant to assign",
-                                    "=",
-                                    Applicability::MaybeIncorrect,
-                                );
-                            }
+            StmtKind::Let(local) => {
+                if self.try_recover_let_missing_semi(local).is_some() {
+                    return Ok(Some(stmt));
+                }
+                if let Err(mut e) = self.expect_semi() {
+                    // We might be at the `,` in `let x = foo<bar, baz>;`. Try to recover.
+                    match &mut local.kind {
+                        LocalKind::Init(expr) | LocalKind::InitElse(expr, _) => {
+                            self.check_mistyped_turbofish_with_multiple_type_params(e, expr)
+                                .map_err(|mut e| {
+                                    self.recover_missing_dot(&mut e);
+                                    self.recover_missing_let_else(&mut e, &local.pat, stmt.span);
+                                    e
+                                })?;
+                            // We found `foo<bar, baz>`, have we fully recovered?
+                            self.expect_semi()?;
                         }
-                        return Err(e);
+                        LocalKind::Decl => {
+                            if let Some(colon_sp) = local.colon_sp {
+                                e.span_label(
+                                    colon_sp,
+                                    format!(
+                                        "while parsing the type for {}",
+                                        local.pat.descr().map_or_else(
+                                            || "the binding".to_string(),
+                                            |n| format!("`{n}`")
+                                        )
+                                    ),
+                                );
+                                let suggest_eq = if self.token == token::Dot
+                                    && let _ = self.bump()
+                                    && let mut snapshot = self.create_snapshot_for_diagnostic()
+                                    && let Ok(_) = snapshot
+                                        .parse_dot_suffix_expr(
+                                            colon_sp,
+                                            self.mk_expr_err(
+                                                colon_sp,
+                                                self.dcx().delayed_bug(
+                                                    "error during `:` -> `=` recovery",
+                                                ),
+                                            ),
+                                        )
+                                        .map_err(Diag::cancel)
+                                {
+                                    true
+                                } else if let Some(op) = self.check_assoc_op()
+                                    && op.node.can_continue_expr_unambiguously()
+                                {
+                                    true
+                                } else {
+                                    false
+                                };
+                                if suggest_eq && let Some(ty) = &local.ty {
+                                    e.span_suggestion_verbose(
+                                        local.pat.span.between(ty.span),
+                                        "use `=` if you meant to assign",
+                                        " = ",
+                                        Applicability::MaybeIncorrect,
+                                    );
+                                }
+                            }
+                            return Err(e);
+                        }
                     }
                 }
                 eat_semi = false;
             }
-            StmtKind::Empty | StmtKind::Item(_) | StmtKind::Let(_) | StmtKind::Semi(_) => {
-                eat_semi = false
-            }
+            StmtKind::Empty | StmtKind::Item(_) | StmtKind::Semi(_) => eat_semi = false,
         }
 
         if add_semi_to_stmt || (eat_semi && self.eat(exp!(Semi))) {
@@ -1147,7 +1168,7 @@ impl<'a> Parser<'a> {
         rules: BlockCheckMode,
         span: Span,
     ) -> Box<Block> {
-        Box::new(Block { stmts, id: DUMMY_NODE_ID, rules, span, tokens: None })
+        Box::new(Block { stmts, id: DUMMY_NODE_ID, rules, span })
     }
 
     pub(super) fn mk_stmt(&self, span: Span, kind: StmtKind) -> Stmt {

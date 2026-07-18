@@ -30,7 +30,7 @@ pub(crate) fn expand_deriving_debug(
             name: sym::fmt,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: vec![(fmtr, sym::f)],
+            nonself_args: vec![(fmtr, sym::character('f'))],
             ret_ty: Path(path_std!(fmt::Result)),
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy:
@@ -167,7 +167,7 @@ fn show_substructure(cx: &ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) ->
         let ty_dyn_debug = cx.ty(
             span,
             ast::TyKind::TraitObject(
-                vec![cx.trait_bound(path_debug, false)],
+                thin_vec![cx.trait_bound(path_debug, false)],
                 ast::TraitObjectSyntax::Dyn,
             ),
         );

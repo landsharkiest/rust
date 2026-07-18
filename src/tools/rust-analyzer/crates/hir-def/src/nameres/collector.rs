@@ -5,7 +5,7 @@
 
 use std::{iter, mem, ops::Range};
 
-use base_db::{BuiltDependency, Crate, CrateOrigin, LangCrateOrigin};
+use base_db::{BuiltDependency, Crate, CrateOrigin, LangCrateOrigin, SourceDatabase};
 use cfg::{CfgAtom, CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -15,14 +15,14 @@ use hir_expand::{
     builtin::{BuiltinDeriveExpander, find_builtin_attr, find_builtin_derive, find_builtin_macro},
     mod_path::{ModPath, PathKind},
     name::{AsName, Name},
-    proc_macro::CustomProcMacroExpander,
+    proc_macro::{CustomProcMacroExpander, ProcMacros},
 };
 use intern::{Interned, Symbol, sym};
 use itertools::izip;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use span::{Edition, FileAstId, SyntaxContext};
+use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
 use stdx::always;
 use syntax::ast;
 use triomphe::Arc;
@@ -33,8 +33,7 @@ use crate::{
     ImplLoc, Intern, ItemContainerId, Lookup, Macro2Id, Macro2Loc, MacroExpander, MacroId,
     MacroRulesId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId,
     ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UnresolvedMacro, UseId,
-    UseLoc,
-    db::DefDatabase,
+    UseLoc, file_item_tree,
     item_scope::{GlobId, ImportId, ImportOrExternCrate, PerNsGlobImports},
     item_tree::{
         self, Attrs, AttrsOrCfg, FieldsShape, ImportAlias, ImportKind, ItemTree, ItemTreeAstId,
@@ -61,7 +60,7 @@ const GLOB_RECURSION_LIMIT: usize = 100;
 const FIXED_POINT_LIMIT: usize = 8192;
 
 pub(super) fn collect_defs(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     def_map: DefMap,
     tree_id: TreeId,
     crate_local_def_map: Option<&LocalDefMap>,
@@ -79,9 +78,9 @@ pub(super) fn collect_defs(
     }
 
     let proc_macros = if krate.is_proc_macro {
-        db.proc_macros_for_crate(def_map.krate)
+        ProcMacros::get_for_crate(db, def_map.krate)
             .and_then(|proc_macros| {
-                proc_macros.list(db.syntax_context(tree_id.file_id(), krate.edition))
+                proc_macros.list(tree_id.file_id().syntax_context(db, krate.edition))
             })
             .unwrap_or_default()
     } else {
@@ -231,7 +230,7 @@ struct DeferredBuiltinDerive {
 
 /// Walks the tree of module recursively
 struct DefCollector<'db> {
-    db: &'db dyn DefDatabase,
+    db: &'db dyn SourceDatabase,
     def_map: DefMap,
     local_def_map: LocalDefMap,
     /// Set only in case of blocks.
@@ -279,7 +278,7 @@ impl<'db> DefCollector<'db> {
         let _p = tracing::info_span!("seed_with_top_level").entered();
 
         let file_id = self.def_map.krate.root_file_id(self.db);
-        let item_tree = self.db.file_item_tree(file_id.into());
+        let item_tree = file_item_tree(self.db, file_id.into(), self.def_map.krate);
         let attrs = match item_tree.top_level_attrs() {
             AttrsOrCfg::Enabled { attrs } => attrs.as_ref(),
             AttrsOrCfg::CfgDisabled(it) => it.1.as_ref(),
@@ -316,7 +315,7 @@ impl<'db> DefCollector<'db> {
                                 _ => None,
                             },
                         );
-                    crate_data.unstable_features.extend(features);
+                    features.for_each(|feature| crate_data.unstable_features.enable(feature));
                 }
                 () if *attr_name == sym::register_tool => {
                     if let Some(ident) = attr.single_ident_value() {
@@ -369,7 +368,14 @@ impl<'db> DefCollector<'db> {
 
         self.inject_prelude();
 
-        if matches!(item_tree.top_level_attrs(), AttrsOrCfg::CfgDisabled(_)) {
+        if let AttrsOrCfg::CfgDisabled(attrs) = item_tree.top_level_attrs() {
+            let (cfg_expr, _) = &**attrs;
+            self.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
+                self.def_map.root,
+                InFile::new(file_id.into(), ROOT_ERASED_FILE_AST_ID),
+                cfg_expr.clone(),
+                self.cfg_options.clone(),
+            ));
             return;
         }
 
@@ -387,7 +393,7 @@ impl<'db> DefCollector<'db> {
     }
 
     fn seed_with_inner(&mut self, tree_id: TreeId) {
-        let item_tree = tree_id.item_tree(self.db);
+        let item_tree = tree_id.item_tree(self.db, self.def_map.krate);
         let is_cfg_enabled = matches!(item_tree.top_level_attrs(), AttrsOrCfg::Enabled { .. });
         if is_cfg_enabled {
             self.inject_prelude();
@@ -609,7 +615,7 @@ impl<'db> DefCollector<'db> {
         let (expander, kind) = match self.proc_macros.iter().find(|(n, _, _)| n == &def.name) {
             Some(_)
                 if kind == hir_expand::proc_macro::ProcMacroKind::Attr
-                    && !self.db.expand_proc_attr_macros() =>
+                    && !crate::ExpandProcAttrMacros::get(self.db).enabled(self.db) =>
             {
                 (CustomProcMacroExpander::disabled_proc_attr(), kind)
             }
@@ -634,6 +640,7 @@ impl<'db> DefCollector<'db> {
             crate_data.exported_derives.insert(proc_macro_id.into(), helpers);
         }
         crate_data.fn_proc_macro_mapping.insert(fn_id, proc_macro_id);
+        crate_data.fn_proc_macro_mapping_back.insert(proc_macro_id, fn_id);
     }
 
     /// Define a macro with `macro_rules`.
@@ -1019,7 +1026,7 @@ impl<'db> DefCollector<'db> {
                             .enum_variants(self.db)
                             .variants
                             .iter()
-                            .map(|&(variant, ref name, _)| {
+                            .map(|(name, &(variant, _))| {
                                 let res = PerNs::both(variant.into(), variant.into(), vis, None);
                                 (Some(name.clone()), res)
                             })
@@ -1328,7 +1335,7 @@ impl<'db> DefCollector<'db> {
                     BuiltinShadowMode::Module,
                     Some(subns),
                 );
-                resolved_res.resolved_def.take_macros().map(|it| (it, self.db.macro_def(it)))
+                resolved_res.resolved_def.take_macros().map(|it| (it, it.definition(self.db)))
             };
             let resolver_def_id = |path: &_| resolver(&self.def_map, path).map(|(_, it)| it);
 
@@ -1707,7 +1714,7 @@ impl<'db> DefCollector<'db> {
         }
         let file_id = macro_call_id.into();
 
-        let item_tree = self.db.file_item_tree(file_id);
+        let item_tree = file_item_tree(self.db, file_id, self.def_map.krate);
 
         // Derive helpers that are in scope for an item are also in scope for attribute macro expansions
         // of that item (but not derive or fn like macros).
@@ -1779,7 +1786,7 @@ impl<'db> DefCollector<'db> {
                                 BuiltinShadowMode::Module,
                                 Some(MacroSubNs::Bang),
                             );
-                            resolved_res.resolved_def.take_macros().map(|it| self.db.macro_def(it))
+                            resolved_res.resolved_def.take_macros().map(|it| it.definition(self.db))
                         },
                         &mut |_, _| (),
                     );
@@ -2095,6 +2102,8 @@ impl ModCollector<'_, '_> {
 
                     let vis = resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
 
+                    update_def(self.def_collector, fn_id.into(), &it.name, vis, false);
+
                     if self.def_collector.def_map.block.is_none()
                         && self.def_collector.is_proc_macro
                         && self.module_id == self.def_collector.def_map.root
@@ -2105,9 +2114,14 @@ impl ModCollector<'_, '_> {
                             InFile::new(self.file_id(), id),
                             fn_id,
                         );
-                    }
 
-                    update_def(self.def_collector, fn_id.into(), &it.name, vis, false);
+                        // A proc macro is implemented as a function, but it's treated as a macro, not a function.
+                        // You cannot call it like a function, for example, except in its defining crate.
+                        // So we keep the function definition, but remove it from the scope, leaving only the macro.
+                        self.def_collector.def_map[module_id]
+                            .scope
+                            .remove_from_value_ns(&it.name, fn_id.into());
+                    }
                 }
                 ModItemId::Struct(id) => {
                     let it = &self.item_tree[id];
@@ -2327,10 +2341,10 @@ impl ModCollector<'_, '_> {
                     self.file_id(),
                     &module.name,
                     path_attr.as_deref(),
-                    self.def_collector.def_map.krate,
                 ) {
                     Ok((file_id, is_mod_rs, mod_dir)) => {
-                        let item_tree = db.file_item_tree(file_id.into());
+                        let item_tree =
+                            file_item_tree(db, file_id.into(), self.def_collector.def_map.krate);
                         match item_tree.top_level_attrs() {
                             AttrsOrCfg::CfgDisabled(cfg) => {
                                 self.emit_unconfigured_diagnostic(
@@ -2413,6 +2427,8 @@ impl ModCollector<'_, '_> {
                 self.def_collector.db,
                 self.def_collector.def_map.krate,
                 self.def_collector.def_map.block_id(),
+                Some(self.module_id),
+                name.clone(),
             )
             .to_static()
         };
@@ -2514,12 +2530,8 @@ impl ModCollector<'_, '_> {
         // Case 1: builtin macros
         let expander = if attrs.by_key(sym::rustc_builtin_macro).exists() {
             // `#[rustc_builtin_macro = "builtin_name"]` overrides the `macro_rules!` name.
-            let name;
             let name = match attrs.by_key(sym::rustc_builtin_macro).string_value_with_span() {
-                Some((it, span)) => {
-                    name = Name::new_symbol(Symbol::intern(it), span.ctx);
-                    &name
-                }
+                Some((it, span)) => &Name::new_symbol(Symbol::intern(it), span.ctx),
                 None => {
                     let explicit_name =
                         attrs.by_key(sym::rustc_builtin_macro).tt_values().next().and_then(|tt| {
@@ -2529,10 +2541,7 @@ impl ModCollector<'_, '_> {
                             }
                         });
                     match explicit_name {
-                        Some(ident) => {
-                            name = ident.as_name();
-                            &name
-                        }
+                        Some(ident) => &ident.as_name(),
                         None => &mac.name,
                     }
                 }
@@ -2545,13 +2554,13 @@ impl ModCollector<'_, '_> {
                         .def_map
                         .diagnostics
                         .push(DefDiagnostic::unimplemented_builtin_macro(self.module_id, f_ast_id));
-                    return;
+                    MacroExpander::UnimplementedBuiltIn
                 }
             }
         } else {
             // Case 2: normal `macro_rules!` macro
             let id = InFile::new(self.file_id(), ast_id);
-            let decl_expander = self.def_collector.db.decl_macro_expander(krate, id.upcast());
+            let decl_expander = id.upcast().decl_macro_expander(self.def_collector.db, krate);
             let styles = decl_expander.mac.rule_styles();
             MacroExpander::Declarative { styles }
         };
@@ -2624,12 +2633,12 @@ impl ModCollector<'_, '_> {
                     .def_map
                     .diagnostics
                     .push(DefDiagnostic::unimplemented_builtin_macro(self.module_id, f_ast_id));
-                return;
+                MacroExpander::UnimplementedBuiltIn
             }
         } else {
             // Case 2: normal `macro`
             let id = InFile::new(self.file_id(), ast_id);
-            let decl_expander = self.def_collector.db.decl_macro_expander(krate, id.upcast());
+            let decl_expander = id.upcast().decl_macro_expander(self.def_collector.db, krate);
             let styles = decl_expander.mac.rule_styles();
             MacroExpander::Declarative { styles }
         };
@@ -2692,7 +2701,7 @@ impl ModCollector<'_, '_> {
                         .or_else(|| def_map[self.module_id].scope.get(name).take_macros())
                         .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
                         .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                        .map(|it| self.def_collector.db.macro_def(it))
+                        .map(|it| it.definition(self.def_collector.db))
                 })
             },
             &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
@@ -2820,11 +2829,11 @@ foo!(KABOOM);
         let fixture = r#"
 //- /lib.rs crate:foo crate-attr:recursion_limit="4" crate-attr:no_core crate-attr:no_std crate-attr:feature(register_tool)
         "#;
-        let (db, file_id) = TestDB::with_single_file(fixture);
-        let def_map = crate_def_map(&db, file_id.krate(&db));
+        let (db, _) = TestDB::with_single_file(fixture);
+        let def_map = crate_def_map(&db, db.test_crate());
         assert_eq!(def_map.recursion_limit(), 4);
         assert!(def_map.is_no_core());
         assert!(def_map.is_no_std());
-        assert!(def_map.is_unstable_feature_enabled(&sym::register_tool));
+        assert!(def_map.features().is_enabled(&sym::register_tool));
     }
 }

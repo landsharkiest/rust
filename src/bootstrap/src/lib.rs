@@ -26,7 +26,6 @@ use std::time::{Instant, SystemTime};
 use std::{env, fs, io, str};
 
 use build_helper::ci::gha;
-use build_helper::exit;
 use cc::Tool;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use utils::build_stamp::BuildStamp;
@@ -42,9 +41,9 @@ use crate::utils::helpers::{self, dir_is_empty, exe, libdir, set_file_times, spl
 mod core;
 mod utils;
 
-pub use core::builder::PathSet;
 #[cfg(feature = "tracing")]
 pub use core::builder::STEP_SPAN_TARGET;
+pub use core::builder::{PathSet, StepStack};
 pub use core::config::flags::{Flags, Subcommand};
 pub use core::config::{ChangeId, Config};
 
@@ -177,13 +176,21 @@ impl std::str::FromStr for CodegenBackendKind {
 }
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
-pub enum DocTests {
-    /// Run normal tests and doc tests (default).
-    Yes,
-    /// Do not run any doc tests.
-    No,
+pub enum TestTarget {
+    /// Run unit, integration and doc tests (default).
+    Default,
+    /// Run unit, integration, doc tests, examples, bins, benchmarks (no doc tests).
+    AllTargets,
     /// Only run doc tests.
-    Only,
+    DocOnly,
+    /// Only run unit and integration tests.
+    Tests,
+}
+
+impl TestTarget {
+    fn runs_doctests(&self) -> bool {
+        matches!(self, TestTarget::DocOnly | TestTarget::Default)
+    }
 }
 
 pub enum GitRepo {
@@ -222,7 +229,7 @@ pub struct Build {
     in_tree_gcc_info: GitInfo,
     local_rebuild: bool,
     fail_fast: bool,
-    doc_tests: DocTests,
+    test_target: TestTarget,
     verbosity: usize,
 
     /// Build triple for the pre-compiled snapshot compiler.
@@ -535,14 +542,12 @@ impl Build {
             initial_lld,
             initial_relative_libdir,
             initial_rustc: config.initial_rustc.clone(),
-            initial_rustdoc: config
-                .initial_rustc
-                .with_file_name(exe("rustdoc", config.host_target)),
+            initial_rustdoc: config.initial_rustdoc.clone(),
             initial_cargo: config.initial_cargo.clone(),
             initial_sysroot: config.initial_sysroot.clone(),
             local_rebuild: config.local_rebuild,
             fail_fast: config.cmd.fail_fast(),
-            doc_tests: config.cmd.doc_tests(),
+            test_target: config.cmd.test_target(),
             verbosity: config.exec_ctx.verbosity as usize,
 
             host_target: config.host_target,
@@ -667,6 +672,10 @@ impl Build {
     )]
     pub fn require_submodule(&self, submodule: &str, err_hint: Option<&str>) {
         if self.rust_info().is_from_tarball() {
+            return;
+        }
+
+        if self.config.dry_run() {
             return;
         }
 
@@ -875,6 +884,12 @@ impl Build {
         }
         if self.config.compile_time_deps && kind == Kind::Check {
             features.push("check_only");
+        }
+
+        if crates.iter().any(|c| c == "rustc_transmute") {
+            // for `x test rustc_transmute`, this feature isn't enabled automatically by a
+            // dependent crate.
+            features.push("rustc");
         }
 
         // If debug logging is on, then we want the default for tracing:
@@ -1264,7 +1279,7 @@ impl Build {
 
     /// Returns C flags that `cc-rs` thinks should be enabled for the
     /// specified target by default.
-    fn cc_handled_clags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
+    fn cc_handled_cflags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
         if self.config.dry_run() {
             return Vec::new();
         }
@@ -1484,7 +1499,7 @@ impl Build {
         if let Some(path) = finder.maybe_have("wasmtime")
             && let Ok(mut path) = path.into_os_string().into_string()
         {
-            path.push_str(" run -C cache=n --dir .");
+            path.push_str(" run -Wexceptions -C cache=n --dir .");
             // Make sure that tests have access to RUSTC_BOOTSTRAP. This (for example) is
             // required for libtest to work on beta/stable channels.
             //
@@ -1663,6 +1678,9 @@ impl Build {
 
     /// Returns the `a.b.c` version that the given package is at.
     fn release_num(&self, package: &str) -> String {
+        if self.config.dry_run() {
+            return "0.0.0 (dry-run)".into();
+        }
         let toml_file_name = self.src.join(format!("src/tools/{package}/Cargo.toml"));
         let toml = t!(fs::read_to_string(toml_file_name));
         for line in toml.lines() {
@@ -1717,7 +1735,9 @@ impl Build {
                 }
             }
         }
-        ret.sort_unstable_by_key(|krate| krate.name.clone()); // reproducible order needed for tests
+
+        // Sort the crates so that bootstrap unit tests can assume a deterministic order.
+        ret.sort_unstable_by(|a, b| Ord::cmp(&a.name, &b.name));
         ret
     }
 
@@ -2101,9 +2121,11 @@ impl Compiler {
 }
 
 fn envify(s: &str) -> String {
+    // Converting foo-bar to FOO_BAR is a fairly idomatic mapping to an environment variable name.
+    // We also convert '.' to '_' to fix https://github.com/rust-lang/rust/issues/158090
     s.chars()
         .map(|c| match c {
-            '-' => '_',
+            '-' | '.' => '_',
             c => c,
         })
         .flat_map(|c| c.to_uppercase())
@@ -2127,4 +2149,11 @@ pub fn prepare_behaviour_dump_dir(build: &Build) {
 
         t!(INITIALIZED.set(true));
     }
+}
+
+#[macro_export]
+macro_rules! exit {
+    ($code:expr) => {
+        $crate::utils::helpers::detail_exit($code, cfg!(test));
+    };
 }

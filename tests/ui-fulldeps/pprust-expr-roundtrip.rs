@@ -38,9 +38,8 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
 use rustc_session::parse::ParseSess;
-use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
-use rustc_span::DUMMY_SP;
+use rustc_span::{DUMMY_SP, Spanned};
 use thin_vec::{thin_vec, ThinVec};
 
 // Helper functions for building exprs
@@ -50,7 +49,7 @@ fn expr(kind: ExprKind) -> Box<Expr> {
 
 fn make_x() -> Box<Expr> {
     let seg = PathSegment::from_ident(Ident::from_str("x"));
-    let path = Path { segments: thin_vec![seg], span: DUMMY_SP, tokens: None };
+    let path = Path { segments: thin_vec![seg], span: DUMMY_SP };
     expr(ExprKind::Path(None, path))
 }
 
@@ -112,7 +111,6 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(Box<Expr>)) {
                     id: DUMMY_NODE_ID,
                     rules: BlockCheckMode::Default,
                     span: DUMMY_SP,
-                    tokens: None,
                 });
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::If(e, block.clone(), None)));
             }
@@ -176,7 +174,6 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(Box<Expr>)) {
                     id: DUMMY_NODE_ID,
                     kind: PatKind::Wild,
                     span: DUMMY_SP,
-                    tokens: None,
                 });
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::Let(pat.clone(), e, DUMMY_SP, Recovered::No))

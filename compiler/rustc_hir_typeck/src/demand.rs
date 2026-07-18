@@ -1,14 +1,13 @@
 use rustc_errors::{Applicability, Diag, MultiSpan, listify};
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, find_attr};
 use rustc_infer::infer::DefineOpaqueTypes;
-use rustc_middle::bug;
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, AssocItem, BottomUpFolder, Ty, TypeFoldable, TypeVisitableExt};
+use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Ident, Span, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::ObligationCause;
@@ -41,6 +40,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             || self.suggest_semicolon_in_repeat_expr(err, expr, expr_ty)
             || self.suggest_deref_ref_or_into(err, expr, expected, expr_ty, expected_ty_expr)
             || self.suggest_option_to_bool(err, expr, expr_ty, expected)
+            || self.suggest_collect(err, expr, expected, expr_ty)
             || self.suggest_compatible_variants(err, expr, expected, expr_ty)
             || self.suggest_non_zero_new_unwrap(err, expr, expected, expr_ty)
             || self.suggest_calling_boxed_future_when_appropriate(err, expr, expected, expr_ty)
@@ -261,11 +261,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         mut expected_ty_expr: Option<&'tcx hir::Expr<'tcx>>,
         allow_two_phase: AllowTwoPhase,
     ) -> Result<Ty<'tcx>, Diag<'a>> {
-        let expected = if self.next_trait_solver() {
-            expected
-        } else {
-            self.resolve_vars_with_obligations(expected)
-        };
+        let expected = self.resolve_vars_with_obligations(expected);
 
         let e = match self.coerce(expr, checked_ty, expected, allow_two_phase, None) {
             Ok(ty) => return Ok(ty),
@@ -336,7 +332,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let mut expr_finder = FindExprs { hir_id: local_hir_id, uses: init.into_iter().collect() };
-        let body = self.tcx.hir_body_owned_by(self.body_id);
+        let body = self.tcx.hir_body_owned_by(self.body_def_id);
         expr_finder.visit_expr(body.value);
 
         // Replaces all of the variables in the given type with a fresh inference variable.
@@ -347,7 +343,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     match infer {
                         ty::TyVar(_) => self.next_ty_var(DUMMY_SP),
                         ty::IntVar(_) => self.next_int_var(),
-                        ty::FloatVar(_) => self.next_float_var(),
+                        ty::FloatVar(_) => self.next_float_var(DUMMY_SP, None),
                         ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => {
                             bug!("unexpected fresh ty outside of the trait solver")
                         }
@@ -406,9 +402,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // Unify the method signature with our incompatible arg, to
                     // do inference in the *opposite* direction and to find out
                     // what our ideal rcvr ty would look like.
+                    let Some(input_arg) = method.sig.inputs().get(idx + 1) else {
+                        if method.sig.splatted().is_some() {
+                            // FIXME(splat): when the arg is splatted, adjust its index, to handle the type mismatch properly
+                            return None;
+                        } else {
+                            span_bug!(
+                                self.tcx.def_span(method.def_id),
+                                "arg index {} out of bounds for method with {} inputs",
+                                idx + 1,
+                                method.sig.inputs().len(),
+                            );
+                        }
+                    };
                     let _ = self
                         .at(&ObligationCause::dummy(), self.param_env)
-                        .eq(DefineOpaqueTypes::Yes, method.sig.inputs()[idx + 1], arg_ty)
+                        .eq(DefineOpaqueTypes::Yes, *input_arg, arg_ty)
                         .ok()?;
                     self.select_obligations_where_possible(|errs| {
                         // Yeet the errors, we're already reporting errors.
@@ -724,7 +733,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         hir::Path {
                             res:
                                 hir::def::Res::Def(
-                                    hir::def::DefKind::Static { .. } | hir::def::DefKind::Const,
+                                    hir::def::DefKind::Static { .. }
+                                    | hir::def::DefKind::Const { .. },
                                     def_id,
                                 ),
                             ..
@@ -888,7 +898,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ]);
             // We suggest changing the argument from `mut ident: &Ty` to `ident: &'_ mut Ty` and the
             // assignment from `ident = val;` to `*ident = val;`.
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 "you might have meant to mutate the pointed at value being passed in, instead of \
                 changing the reference in the local binding",
                 sugg,
@@ -1008,7 +1018,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         );
         let container_id = pick.item.container_id(self.tcx);
         let container = with_no_trimmed_paths!(self.tcx.def_path_str(container_id));
-        for def_id in pick.import_ids {
+        for &def_id in pick.import_ids {
             let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
             path_span
                 .push_span_label(self.tcx.hir_span(hir_id), format!("`{container}` imported here"));
@@ -1092,7 +1102,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 //
                 // FIXME? Other potential candidate methods: `as_ref` and
                 // `as_mut`?
-                && find_attr!(self.tcx.get_all_attrs(m.def_id), AttributeKind::RustcConversionSuggestion)
+                && find_attr!(self.tcx, m.def_id, RustcConversionSuggestion)
             },
         );
 

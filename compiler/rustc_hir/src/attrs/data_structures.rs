@@ -1,39 +1,43 @@
 use std::borrow::Cow;
+use std::fmt;
 use std::path::PathBuf;
 
 pub use ReprAttr::*;
 use rustc_abi::Align;
 pub use rustc_ast::attr::data_structures::*;
+use rustc_ast::expand::autodiff_attrs::{DiffActivity, DiffMode};
+use rustc_ast::expand::typetree::TypeTree;
 use rustc_ast::token::DocFragmentKind;
 use rustc_ast::{AttrStyle, Path, ast};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 use rustc_hir::LangItem;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic, PrintAttribute};
+use rustc_macros::{Decodable, Encodable, PrintAttribute, StableHash};
 use rustc_span::def_id::DefId;
 use rustc_span::hygiene::Transparency;
 use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol};
 pub use rustc_target::spec::SanitizerSet;
 use thin_vec::ThinVec;
 
+use crate::attrs::diagnostic::*;
 use crate::attrs::pretty_printing::PrintAttribute;
 use crate::limit::Limit;
 use crate::{DefaultBodyStability, PartialConstStability, RustcVersion, Stability};
 
-#[derive(Copy, Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum EiiImplResolution {
     /// Usually, finding the extern item that an EII implementation implements means finding
     /// the defid of the associated attribute macro, and looking at *its* attributes to find
     /// what foreign item its associated with.
     Macro(DefId),
     /// Sometimes though, we already know statically and can skip some name resolution.
-    /// Stored together with the eii's name for diagnostics.
-    Known(EiiDecl),
+    /// DefId of the extern item that the EII implementation implements.
+    Known(DefId),
     /// For when resolution failed, but we want to continue compilation
     Error(ErrorGuaranteed),
 }
 
-#[derive(Copy, Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct EiiImpl {
     pub resolution: EiiImplResolution,
     pub impl_marked_unsafe: bool,
@@ -42,7 +46,7 @@ pub struct EiiImpl {
     pub is_default: bool,
 }
 
-#[derive(Copy, Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct EiiDecl {
     pub foreign_item: DefId,
     /// whether or not it is unsafe to implement this EII
@@ -50,7 +54,7 @@ pub struct EiiDecl {
     pub name: Ident,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, HashStable_Generic, PrintAttribute)]
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
 pub enum CguKind {
     No,
     PreDashLto,
@@ -58,7 +62,7 @@ pub enum CguKind {
     Any,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, HashStable_Generic, PrintAttribute)]
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
 pub enum CguFields {
     PartitionReused { cfg: Symbol, module: Symbol },
     PartitionCodegened { cfg: Symbol, module: Symbol },
@@ -66,7 +70,7 @@ pub enum CguFields {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, PrintAttribute)]
-#[derive(HashStable_Generic, Encodable, Decodable)]
+#[derive(StableHash, Encodable, Decodable)]
 pub enum DivergingFallbackBehavior {
     /// Always fallback to `()` (aka "always spontaneous decay")
     ToUnit,
@@ -78,7 +82,7 @@ pub enum DivergingFallbackBehavior {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, PrintAttribute, Default)]
-#[derive(HashStable_Generic, Encodable, Decodable)]
+#[derive(StableHash, Encodable, Decodable)]
 pub enum DivergingBlockBehavior {
     /// This is the current stable behavior:
     ///
@@ -101,7 +105,7 @@ pub enum DivergingBlockBehavior {
     Unit,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, HashStable_Generic, PrintAttribute)]
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
 pub enum InlineAttr {
     None,
     Hint,
@@ -125,24 +129,30 @@ impl InlineAttr {
     }
 }
 
-#[derive(
-    Copy,
-    Clone,
-    Encodable,
-    Decodable,
-    Debug,
-    PartialEq,
-    Eq,
-    HashStable_Generic,
-    PrintAttribute
-)]
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, StableHash, PrintAttribute)]
+pub enum UnrollAttr {
+    Hint,
+    Full,
+    Never,
+    Count(u32),
+}
+
+#[derive(Copy, Clone, Encodable, Decodable, Debug, PartialEq, Eq, StableHash, PrintAttribute)]
 pub enum InstructionSetAttr {
     ArmA32,
     ArmT32,
 }
 
+#[derive(Copy, Clone, PartialEq, Encodable, Decodable, Debug, Eq, StableHash, PrintAttribute)]
+pub enum InstrumentFnAttr {
+    /// `#[instrument_fn = "on"]`
+    On,
+    /// `#[instrument_fn = "off"]`
+    Off,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, PrintAttribute)]
-#[derive(Encodable, Decodable, HashStable_Generic)]
+#[derive(Encodable, Decodable, StableHash)]
 pub enum OptimizeAttr {
     /// No `#[optimize(..)]` attribute
     #[default]
@@ -161,7 +171,7 @@ impl OptimizeAttr {
     }
 }
 
-#[derive(PartialEq, Debug, Encodable, Decodable, Copy, Clone, HashStable_Generic, PrintAttribute)]
+#[derive(PartialEq, Debug, Encodable, Decodable, Copy, Clone, StableHash, PrintAttribute)]
 pub enum ReprAttr {
     ReprInt(IntType),
     ReprRust,
@@ -178,13 +188,13 @@ pub enum TransparencyError {
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
-#[derive(Encodable, Decodable, HashStable_Generic, PrintAttribute)]
+#[derive(Encodable, Decodable, StableHash, PrintAttribute)]
 pub enum IntType {
     SignedInt(ast::IntTy),
     UnsignedInt(ast::UintTy),
 }
 
-#[derive(Copy, Debug, Encodable, Decodable, Clone, HashStable_Generic, PrintAttribute)]
+#[derive(Copy, Debug, Encodable, Decodable, Clone, StableHash, PrintAttribute)]
 pub struct Deprecation {
     pub since: DeprecatedSince,
     /// The note to issue a reason.
@@ -196,7 +206,7 @@ pub struct Deprecation {
 }
 
 /// Release in which an API is deprecated.
-#[derive(Copy, Debug, Encodable, Decodable, Clone, HashStable_Generic, PrintAttribute)]
+#[derive(Copy, Debug, Encodable, Decodable, Clone, StableHash, PrintAttribute)]
 pub enum DeprecatedSince {
     RustcVersion(RustcVersion),
     /// Deprecated in the future ("to be determined").
@@ -213,7 +223,7 @@ pub enum DeprecatedSince {
 
 /// Successfully-parsed value of a `#[coverage(..)]` attribute.
 #[derive(Copy, Debug, Eq, PartialEq, Encodable, Decodable, Clone)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum CoverageAttrKind {
     On,
     Off,
@@ -221,7 +231,7 @@ pub enum CoverageAttrKind {
 
 /// Successfully-parsed value of a `#[rustc_abi(..)]` attribute.
 #[derive(Copy, Debug, Eq, PartialEq, Encodable, Decodable, Clone)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum RustcAbiAttrKind {
     Debug,
     AssertEq,
@@ -252,7 +262,7 @@ impl Deprecation {
 /// `#[used(compiler)]`
 /// `#[used(linker)]`
 #[derive(Encodable, Decodable, Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum UsedBy {
     Default,
     Compiler,
@@ -260,7 +270,7 @@ pub enum UsedBy {
 }
 
 #[derive(Encodable, Decodable, Clone, Debug, PartialEq, Eq, Hash)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum MacroUseArgs {
     UseAll,
     UseSpecific(ThinVec<Ident>),
@@ -272,16 +282,16 @@ impl Default for MacroUseArgs {
     }
 }
 
-#[derive(Debug, Clone, Encodable, Decodable, HashStable_Generic)]
-pub struct StrippedCfgItem<ModId = DefId> {
-    pub parent_module: ModId,
+#[derive(Debug, Clone, Encodable, Decodable, StableHash)]
+pub struct StrippedCfgItem<ScopeId = DefId> {
+    pub parent_scope: ScopeId,
     pub ident: Ident,
     pub cfg: (CfgEntry, Span),
 }
 
-impl<ModId> StrippedCfgItem<ModId> {
-    pub fn map_mod_id<New>(self, f: impl FnOnce(ModId) -> New) -> StrippedCfgItem<New> {
-        StrippedCfgItem { parent_module: f(self.parent_module), ident: self.ident, cfg: self.cfg }
+impl<ScopeId> StrippedCfgItem<ScopeId> {
+    pub fn map_scope_id<New>(self, f: impl FnOnce(ScopeId) -> New) -> StrippedCfgItem<New> {
+        StrippedCfgItem { parent_scope: f(self.parent_scope), ident: self.ident, cfg: self.cfg }
     }
 }
 
@@ -290,7 +300,7 @@ impl<ModId> StrippedCfgItem<ModId> {
 ///
 /// See <https://llvm.org/docs/LangRef.html#linkage-types> for more details about these variants.
 #[derive(Encodable, Decodable, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum Linkage {
     AvailableExternally,
     Common,
@@ -304,7 +314,7 @@ pub enum Linkage {
 }
 
 #[derive(Clone, Copy, Decodable, Debug, Encodable, PartialEq)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum MirDialect {
     Analysis,
     Built,
@@ -323,7 +333,7 @@ impl IntoDiagArg for MirDialect {
 }
 
 #[derive(Clone, Copy, Decodable, Debug, Encodable, PartialEq)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 pub enum MirPhase {
     Initial,
     PostCleanup,
@@ -343,17 +353,7 @@ impl IntoDiagArg for MirPhase {
 
 /// Different ways that the PE Format can decorate a symbol name.
 /// From <https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#import-name-type>
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Encodable,
-    Decodable,
-    HashStable_Generic,
-    PartialEq,
-    Eq,
-    PrintAttribute
-)]
+#[derive(Copy, Clone, Debug, Encodable, Decodable, StableHash, PartialEq, Eq, PrintAttribute)]
 pub enum PeImportNameType {
     /// IMPORT_ORDINAL
     /// Uses the ordinal (i.e., a number) rather than the name.
@@ -383,7 +383,7 @@ pub enum PeImportNameType {
     Decodable,
     PrintAttribute
 )]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub enum NativeLibKind {
     /// Static library (e.g. `libfoo.a` on Linux or `foo.lib` on Windows/MSVC)
     Static {
@@ -451,7 +451,7 @@ impl NativeLibKind {
     }
 }
 
-#[derive(Debug, Encodable, Decodable, Clone, HashStable_Generic, PrintAttribute)]
+#[derive(Debug, Encodable, Decodable, Clone, StableHash, PrintAttribute)]
 pub struct LinkEntry {
     pub span: Span,
     pub kind: NativeLibKind,
@@ -461,14 +461,14 @@ pub struct LinkEntry {
     pub import_name_type: Option<(PeImportNameType, Span)>,
 }
 
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 #[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug, Encodable, Decodable)]
 pub enum DebuggerVisualizerType {
     Natvis,
     GdbPrettyPrinter,
 }
 
-#[derive(Debug, Encodable, Decodable, Clone, HashStable_Generic, PrintAttribute)]
+#[derive(Debug, Encodable, Decodable, Clone, StableHash, PrintAttribute)]
 pub struct DebugVisualizer {
     pub span: Span,
     pub visualizer_type: DebuggerVisualizerType,
@@ -476,7 +476,7 @@ pub struct DebugVisualizer {
 }
 
 #[derive(Clone, Copy, Debug, Decodable, Encodable, Eq, PartialEq)]
-#[derive(HashStable_Generic, PrintAttribute)]
+#[derive(StableHash, PrintAttribute)]
 #[derive_const(Default)]
 pub enum RtsanSetting {
     Nonblocking,
@@ -486,7 +486,7 @@ pub enum RtsanSetting {
 }
 
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
-#[derive(Encodable, Decodable, HashStable_Generic, PrintAttribute)]
+#[derive(Encodable, Decodable, StableHash, PrintAttribute)]
 pub enum WindowsSubsystemKind {
     Console,
     Windows,
@@ -502,44 +502,93 @@ impl WindowsSubsystemKind {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum DocInline {
     Inline,
     NoInline,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum HideOrShow {
     Hide,
     Show,
 }
 
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
-pub struct CfgInfo {
-    pub name: Symbol,
-    pub name_span: Span,
-    pub value: Option<(Symbol, Span)>,
+#[derive(Clone, Copy, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq)]
+pub struct DocCfgHideShowValue {
+    pub span: Span,
+    /// If `value` is `None`, then it's a `none()` value.
+    pub value: Option<Symbol>,
 }
 
-impl CfgInfo {
-    pub fn span_for_name_and_value(&self) -> Span {
-        if let Some((_, value_span)) = self.value {
-            self.name_span.with_hi(value_span.hi())
-        } else {
-            self.name_span
+impl DocCfgHideShowValue {
+    pub fn new(value: Symbol, span: Span) -> Self {
+        Self { span, value: Some(value) }
+    }
+
+    pub fn new_none(span: Span) -> Self {
+        Self { span, value: None }
+    }
+}
+
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq)]
+pub enum DocCfgHideShow {
+    Any(Span),
+    List(ThinVec<DocCfgHideShowValue>),
+}
+
+impl DocCfgHideShow {
+    pub fn new() -> Self {
+        Self::List(ThinVec::new())
+    }
+
+    pub fn new_with_only_key(span: Span) -> Self {
+        let mut values = ThinVec::with_capacity(1);
+        values.push(DocCfgHideShowValue { span, value: None });
+        Self::List(values)
+    }
+
+    pub fn push_none(&mut self, span: Span) {
+        if let Self::List(values) = self
+            && !values.iter().any(|v| v.value.is_none())
+        {
+            values.push(DocCfgHideShowValue { span, value: None });
+        }
+    }
+
+    pub fn merge_with(&mut self, other: &Self) {
+        match (self, other) {
+            (Self::Any(_), Self::Any(_) | Self::List(_)) => {
+                // Nothing to do.
+            }
+            (s, Self::Any(span)) => {
+                // We "upgrade" the list values to "all".
+                *s = Self::Any(*span);
+            }
+            (Self::List(values), Self::List(other_values)) => {
+                // Having duplicates is not an issue, we simply ignore them. Would be more
+                // convenient to have a `set` type though. T_T
+                for other in other_values {
+                    if !values.iter().any(|value| value.value == other.value) {
+                        values.push(*other);
+                    }
+                }
+            }
         }
     }
 }
 
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct CfgHideShow {
     pub kind: HideOrShow,
-    pub values: ThinVec<CfgInfo>,
+    pub values: FxIndexMap<Symbol, DocCfgHideShow>,
 }
 
-#[derive(Clone, Debug, Default, HashStable_Generic, Decodable, PrintAttribute)]
+#[derive(Clone, Debug, Default, StableHash, Decodable, PrintAttribute)]
 pub struct DocAttribute {
+    pub first_span: Span,
+
     pub aliases: FxIndexMap<Symbol, Span>,
     pub hidden: Option<Span>,
     // Because we need to emit the error if there is more than one `inline` attribute on an item
@@ -577,6 +626,7 @@ pub struct DocAttribute {
 impl<E: rustc_span::SpanEncoder> rustc_serialize::Encodable<E> for DocAttribute {
     fn encode(&self, encoder: &mut E) {
         let DocAttribute {
+            first_span,
             aliases,
             hidden,
             inline,
@@ -599,6 +649,7 @@ impl<E: rustc_span::SpanEncoder> rustc_serialize::Encodable<E> for DocAttribute 
             test_attrs,
             no_crate_inject,
         } = self;
+        rustc_serialize::Encodable::<E>::encode(first_span, encoder);
         rustc_serialize::Encodable::<E>::encode(aliases, encoder);
         rustc_serialize::Encodable::<E>::encode(hidden, encoder);
 
@@ -638,7 +689,7 @@ impl<E: rustc_span::SpanEncoder> rustc_serialize::Encodable<E> for DocAttribute 
 /// | external      | no  | if-ext        | if-ext   | yes |
 /// | yes           | yes | yes           | yes      | yes |
 #[derive(Copy, Clone, Debug, Hash, PartialEq)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum CollapseMacroDebuginfo {
     /// Don't collapse debuginfo for the macro
     No = 0,
@@ -652,7 +703,7 @@ pub enum CollapseMacroDebuginfo {
 
 /// Crate type, as specified by `#![crate_type]`
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Default, PartialOrd, Eq, Ord)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum CrateType {
     /// `#![crate_type = "bin"]`
     Executable,
@@ -752,16 +803,16 @@ impl IntoDiagArg for CrateType {
     }
 }
 
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
-pub enum RustcLayoutType {
-    Abi,
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
+pub enum RustcDumpLayoutKind {
     Align,
-    Size,
-    HomogenousAggregate,
+    BackendRepr,
     Debug,
+    HomogenousAggregate,
+    Size,
 }
 
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute, PartialEq, Eq)]
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq, Eq)]
 pub enum RustcMirKind {
     PeekMaybeInit,
     PeekMaybeUninit,
@@ -771,13 +822,13 @@ pub enum RustcMirKind {
     BorrowckGraphvizFormat { format: BorrowckGraphvizFormatKind },
 }
 
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute, PartialEq, Eq)]
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq, Eq)]
 pub enum BorrowckGraphvizFormatKind {
     TwoPhase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct RustcCleanAttribute {
     pub span: Span,
     pub cfg: Symbol,
@@ -787,10 +838,115 @@ pub struct RustcCleanAttribute {
 
 /// Represents the `except=` or `loaded_from_disk=` argument of `#[rustc_clean]`
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct RustcCleanQueries {
     pub entries: ThinVec<Symbol>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(StableHash, Encodable, Decodable, PrintAttribute)]
+pub struct RustcAutodiff {
+    /// Conceptually either forward or reverse mode AD, as described in various autodiff papers and
+    /// e.g. in the [JAX
+    /// Documentation](https://jax.readthedocs.io/en/latest/_tutorials/advanced-autodiff.html#how-it-s-made-two-foundational-autodiff-functions).
+    pub mode: DiffMode,
+    /// A user-provided, batching width. If not given, we will default to 1 (no batching).
+    /// Calling a differentiated, non-batched function through a loop 100 times is equivalent to:
+    /// - Calling the function 50 times with a batch size of 2
+    /// - Calling the function 25 times with a batch size of 4,
+    /// etc. A batched function takes more (or longer) arguments, and might be able to benefit from
+    /// cache locality, better re-usal of primal values, and other optimizations.
+    /// We will (before LLVM's vectorizer runs) just generate most LLVM-IR instructions `width`
+    /// times, so this massively increases code size. As such, values like 1024 are unlikely to
+    /// work. We should consider limiting this to u8 or u16, but will leave it at u32 for
+    /// experiments for now and focus on documenting the implications of a large width.
+    pub width: u32,
+    pub input_activity: ThinVec<DiffActivity>,
+    pub ret_activity: DiffActivity,
+}
+
+impl RustcAutodiff {
+    pub fn has_primal_ret(&self) -> bool {
+        matches!(self.ret_activity, DiffActivity::Active | DiffActivity::Dual)
+    }
+}
+
+impl RustcAutodiff {
+    pub fn has_ret_activity(&self) -> bool {
+        self.ret_activity != DiffActivity::None
+    }
+    pub fn has_active_only_ret(&self) -> bool {
+        self.ret_activity == DiffActivity::ActiveOnly
+    }
+
+    pub fn error() -> Self {
+        RustcAutodiff {
+            mode: DiffMode::Error,
+            width: 0,
+            ret_activity: DiffActivity::None,
+            input_activity: ThinVec::new(),
+        }
+    }
+
+    pub fn source() -> Self {
+        RustcAutodiff {
+            mode: DiffMode::Source,
+            width: 0,
+            ret_activity: DiffActivity::None,
+            input_activity: ThinVec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.mode != DiffMode::Error
+    }
+
+    pub fn is_source(&self) -> bool {
+        self.mode == DiffMode::Source
+    }
+    pub fn apply_autodiff(&self) -> bool {
+        !matches!(self.mode, DiffMode::Error | DiffMode::Source)
+    }
+
+    pub fn into_item(
+        self,
+        source: String,
+        target: String,
+        inputs: Vec<TypeTree>,
+        output: TypeTree,
+    ) -> AutoDiffItem {
+        AutoDiffItem { source, target, inputs, output, attrs: self }
+    }
+}
+
+/// We generate one of these structs for each `#[autodiff(...)]` attribute.
+#[derive(Clone, Eq, PartialEq, Encodable, Decodable, Debug, StableHash)]
+pub struct AutoDiffItem {
+    /// The name of the function getting differentiated
+    pub source: String,
+    /// The name of the function being generated
+    pub target: String,
+    pub attrs: RustcAutodiff,
+    pub inputs: Vec<TypeTree>,
+    pub output: TypeTree,
+}
+
+impl fmt::Display for AutoDiffItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Differentiating {} -> {}", self.source, self.target)?;
+        write!(f, " with attributes: {:?}", self.attrs)?;
+        write!(f, " with inputs: {:?}", self.inputs)?;
+        write!(f, " with output: {:?}", self.output)
+    }
+}
+
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
+pub struct UnstableRemovedFeature {
+    pub feature: Symbol,
+    pub reason: Symbol,
+    pub link: Symbol,
+    pub since: RustcVersion,
 }
 
 /// Represents parsed *built-in* inert attributes.
@@ -842,13 +998,9 @@ pub struct RustcCleanQueries {
 /// [`rustc_parse`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/index.html
 /// [`rustc_codegen_ssa`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_codegen_ssa/index.html
 /// [`rustc_attr_parsing`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_attr_parsing/index.html
-#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum AttributeKind {
     // tidy-alphabetical-start
-    /// Represents `#[align(N)]`.
-    // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
-    Align { align: Align, span: Span },
-
     /// Represents `#[allow_internal_unsafe]`.
     AllowInternalUnsafe(Span),
 
@@ -856,7 +1008,7 @@ pub enum AttributeKind {
     AllowInternalUnstable(ThinVec<(Symbol, Span)>, Span),
 
     /// Represents `#[automatically_derived]`
-    AutomaticallyDerived(Span),
+    AutomaticallyDerived,
 
     /// Represents the trace attribute of `#[cfg_attr]`
     CfgAttrTrace,
@@ -865,10 +1017,12 @@ pub enum AttributeKind {
     CfgTrace(ThinVec<(CfgEntry, Span)>),
 
     /// Represents `#[cfi_encoding]`
-    CfiEncoding { encoding: Symbol },
+    CfiEncoding {
+        encoding: Symbol,
+    },
 
     /// Represents `#[cold]`.
-    Cold(Span),
+    Cold,
 
     /// Represents `#[collapse_debuginfo]`.
     CollapseDebugInfo(CollapseMacroDebuginfo),
@@ -880,28 +1034,38 @@ pub enum AttributeKind {
     ConstContinue(Span),
 
     /// Represents `#[coroutine]`.
-    Coroutine(Span),
+    Coroutine,
 
     /// Represents `#[coverage(..)]`.
-    Coverage(Span, CoverageAttrKind),
+    Coverage(CoverageAttrKind),
 
     /// Represents `#[crate_name = ...]`
-    CrateName { name: Symbol, name_span: Span, attr_span: Span },
+    CrateName {
+        name: Symbol,
+        name_span: Span,
+        attr_span: Span,
+    },
 
     /// Represents `#![crate_type = ...]`
     CrateType(ThinVec<CrateType>),
 
     /// Represents `#[custom_mir]`.
-    CustomMir(Option<(MirDialect, Span)>, Option<(MirPhase, Span)>, Span),
+    CustomMir(Option<(MirDialect, Span)>, Option<(MirPhase, Span)>),
 
     /// Represents `#[debugger_visualizer]`.
     DebuggerVisualizer(ThinVec<DebugVisualizer>),
 
+    /// Represents `#![default_lib_allocator]`
+    DefaultLibAllocator,
+
     /// Represents [`#[deprecated]`](https://doc.rust-lang.org/stable/reference/attributes/diagnostics.html#the-deprecated-attribute).
-    Deprecation { deprecation: Deprecation, span: Span },
+    Deprecated {
+        deprecation: Deprecation,
+        span: Span,
+    },
 
     /// Represents `#[diagnostic::do_not_recommend]`.
-    DoNotRecommend { attr_span: Span },
+    DoNotRecommend,
 
     /// Represents [`#[doc]`](https://doc.rust-lang.org/stable/rustdoc/write-documentation/the-doc-attribute.html).
     /// Represents all other uses of the [`#[doc]`](https://doc.rust-lang.org/stable/rustdoc/write-documentation/the-doc-attribute.html)
@@ -910,13 +1074,15 @@ pub enum AttributeKind {
 
     /// Represents specifically [`#[doc = "..."]`](https://doc.rust-lang.org/stable/rustdoc/write-documentation/the-doc-attribute.html).
     /// i.e. doc comments.
-    DocComment { style: AttrStyle, kind: DocFragmentKind, span: Span, comment: Symbol },
+    DocComment {
+        style: AttrStyle,
+        kind: DocFragmentKind,
+        span: Span,
+        comment: Symbol,
+    },
 
     /// Implementation detail of `#[eii]`
     EiiDeclaration(EiiDecl),
-
-    /// Implementation detail of `#[eii]`
-    EiiForeignItem,
 
     /// Implementation detail of `#[eii]`
     EiiImpls(ThinVec<EiiImpl>),
@@ -932,8 +1098,11 @@ pub enum AttributeKind {
     /// Represents `#[export_stable]`.
     ExportStable,
 
+    /// Represents `#[feature(...)]`
+    Feature(ThinVec<Ident>, Span),
+
     /// Represents `#[ffi_const]`.
-    FfiConst(Span),
+    FfiConst,
 
     /// Represents `#[ffi_pure]`.
     FfiPure(Span),
@@ -954,20 +1123,31 @@ pub enum AttributeKind {
     /// Represents `#[instruction_set]`
     InstructionSet(InstructionSetAttr),
 
+    /// Represents `#[instrument_fn]`
+    InstrumentFn(InstrumentFnAttr),
+
     /// Represents `#[lang]`
-    Lang(LangItem, Span),
+    Lang(LangItem),
 
     /// Represents `#[link]`.
     Link(ThinVec<LinkEntry>, Span),
 
     /// Represents `#[link_name]`.
-    LinkName { name: Symbol, span: Span },
+    LinkName {
+        name: Symbol,
+        span: Span,
+    },
 
     /// Represents `#[link_ordinal]`.
-    LinkOrdinal { ordinal: u16, span: Span },
+    LinkOrdinal {
+        ordinal: u16,
+        span: Span,
+    },
 
     /// Represents [`#[link_section]`](https://doc.rust-lang.org/reference/abi.html#the-link_section-attribute)
-    LinkSection { name: Symbol, span: Span },
+    LinkSection {
+        name: Symbol,
+    },
 
     /// Represents `#[linkage]`.
     Linkage(Linkage, Span),
@@ -976,28 +1156,39 @@ pub enum AttributeKind {
     LoopMatch(Span),
 
     /// Represents `#[macro_escape]`.
-    MacroEscape(Span),
+    MacroEscape,
 
     /// Represents [`#[macro_export]`](https://doc.rust-lang.org/reference/macros-by-example.html#r-macro.decl.scope.path).
-    MacroExport { span: Span, local_inner_macros: bool },
+    MacroExport {
+        span: Span,
+        local_inner_macros: bool,
+    },
 
     /// Represents `#[macro_use]`.
-    MacroUse { span: Span, arguments: MacroUseArgs },
+    MacroUse {
+        span: Span,
+        arguments: MacroUseArgs,
+    },
 
     /// Represents `#[marker]`.
-    Marker(Span),
+    Marker,
 
     /// Represents [`#[may_dangle]`](https://std-dev-guide.rust-lang.org/tricky/may-dangle.html).
     MayDangle(Span),
 
     /// Represents `#[move_size_limit]`
-    MoveSizeLimit { attr_span: Span, limit_span: Span, limit: Limit },
+    MoveSizeLimit {
+        limit: Limit,
+    },
 
     /// Represents `#[must_not_suspend]`
-    MustNotSupend { reason: Option<Symbol> },
+    MustNotSupend {
+        reason: Option<Symbol>,
+    },
 
     /// Represents `#[must_use]`.
     MustUse {
+        /// Used by `clippy`.
         span: Span,
         /// must_use can optionally have a reason: `#[must_use = "reason this must be used"]`
         reason: Option<Symbol>,
@@ -1016,10 +1207,10 @@ pub enum AttributeKind {
     NoBuiltins,
 
     /// Represents `#[no_core]`
-    NoCore(Span),
+    NoCore,
 
     /// Represents `#[no_implicit_prelude]`
-    NoImplicitPrelude(Span),
+    NoImplicitPrelude,
 
     /// Represents `#[no_link]`
     NoLink,
@@ -1031,10 +1222,49 @@ pub enum AttributeKind {
     NoMangle(Span),
 
     /// Represents `#[no_std]`
-    NoStd(Span),
+    NoStd,
 
     /// Represents `#[non_exhaustive]`
     NonExhaustive(Span),
+
+    /// Represents `#[diagnostic::on_const]`.
+    OnConst {
+        span: Span,
+        /// None if the directive was malformed in some way.
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[diagnostic::on_move]`
+    OnMove {
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents`#[diagnostic::on_type_error]`.
+    OnTypeError {
+        span: Span,
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[rustc_on_unimplemented]` and `#[diagnostic::on_unimplemented]`.
+    OnUnimplemented {
+        /// None if the directive was malformed in some way.
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[diagnostic::on_unknown]`
+    OnUnknown {
+        /// None if the directive was malformed in some way.
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[diagnostic::on_unmatched_args]`.
+    OnUnmatchedArgs {
+        /// None if the directive was malformed in some way.
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[diagnostic::opaque]`.
+    Opaque,
 
     /// Represents `#[optimize(size|speed)]`
     Optimize(OptimizeAttr, Span),
@@ -1043,46 +1273,70 @@ pub enum AttributeKind {
     PanicRuntime,
 
     /// Represents `#[patchable_function_entry]`
-    PatchableFunctionEntry { prefix: u8, entry: u8 },
+    PatchableFunctionEntry {
+        prefix: Option<u8>,
+        entry: Option<u8>,
+        section: Option<Symbol>,
+    },
 
     /// Represents `#[path]`
-    Path(Symbol, Span),
+    Path(Symbol),
 
     /// Represents `#[pattern_complexity_limit]`
-    PatternComplexityLimit { attr_span: Span, limit_span: Span, limit: Limit },
+    PatternComplexityLimit {
+        limit: Limit,
+    },
 
     /// Represents `#[pin_v2]`
     PinV2(Span),
-
-    /// Represents `#[pointee]`
-    Pointee(Span),
 
     /// Represents `#[prelude_import]`
     PreludeImport,
 
     /// Represents `#[proc_macro]`
-    ProcMacro(Span),
+    ProcMacro,
 
     /// Represents `#[proc_macro_attribute]`
-    ProcMacroAttribute(Span),
+    ProcMacroAttribute,
 
     /// Represents `#[proc_macro_derive]`
-    ProcMacroDerive { trait_name: Symbol, helper_attrs: ThinVec<Symbol>, span: Span },
+    ProcMacroDerive {
+        trait_name: Symbol,
+        helper_attrs: ThinVec<Symbol>,
+    },
 
     /// Represents `#[profiler_runtime]`
     ProfilerRuntime,
 
     /// Represents [`#[recursion_limit]`](https://doc.rust-lang.org/reference/attributes/limits.html#the-recursion_limit-attribute)
-    RecursionLimit { attr_span: Span, limit_span: Span, limit: Limit },
+    RecursionLimit {
+        limit: Limit,
+    },
 
     /// Represents `#[reexport_test_harness_main]`
     ReexportTestHarnessMain(Symbol),
 
+    /// Represents `#[register_tool]`
+    RegisterTool(ThinVec<Ident>),
+
     /// Represents [`#[repr]`](https://doc.rust-lang.org/stable/reference/type-layout.html#representations).
-    Repr { reprs: ThinVec<(ReprAttr, Span)>, first_span: Span },
+    Repr {
+        reprs: ThinVec<(ReprAttr, Span)>,
+        first_span: Span,
+    },
 
     /// Represents `#[rustc_abi(..)]`
-    RustcAbi { attr_span: Span, kind: RustcAbiAttrKind },
+    RustcAbi {
+        attr_span: Span,
+        kind: RustcAbiAttrKind,
+    },
+
+    /// Represents `#[align(N)]`.
+    // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
+    RustcAlign {
+        align: Align,
+        span: Span,
+    },
 
     /// Represents `#[rustc_allocator]`
     RustcAllocator,
@@ -1091,7 +1345,9 @@ pub enum AttributeKind {
     RustcAllocatorZeroed,
 
     /// Represents `#[rustc_allocator_zeroed_variant]`
-    RustcAllocatorZeroedVariant { name: Symbol },
+    RustcAllocatorZeroedVariant {
+        name: Symbol,
+    },
 
     /// Represents `#[rustc_allow_const_fn_unstable]`.
     RustcAllowConstFnUnstable(ThinVec<Symbol>, Span),
@@ -1100,7 +1356,10 @@ pub enum AttributeKind {
     RustcAllowIncoherentImpl(Span),
 
     /// Represents `#[rustc_as_ptr]` (used by the `dangling_pointers_from_temporaries` lint).
-    RustcAsPtr(Span),
+    RustcAsPtr,
+
+    /// Represents `#[rustc_autodiff]`.
+    RustcAutodiff(Option<Box<RustcAutodiff>>),
 
     /// Represents `#[rustc_default_body_unstable]`.
     RustcBodyStability {
@@ -1109,8 +1368,10 @@ pub enum AttributeKind {
         span: Span,
     },
     /// Represents `#[rustc_builtin_macro]`.
-    RustcBuiltinMacro { builtin_name: Option<Symbol>, helper_attrs: ThinVec<Symbol>, span: Span },
-
+    RustcBuiltinMacro {
+        builtin_name: Option<Symbol>,
+        helper_attrs: ThinVec<Symbol>,
+    },
     /// Represents `#[rustc_capture_analysis]`
     RustcCaptureAnalysis,
 
@@ -1121,16 +1382,17 @@ pub enum AttributeKind {
     RustcClean(ThinVec<RustcCleanAttribute>),
 
     /// Represents `#[rustc_coherence_is_core]`
-    RustcCoherenceIsCore(Span),
+    RustcCoherenceIsCore,
 
     /// Represents `#[rustc_coinductive]`.
-    RustcCoinductive(Span),
+    RustcCoinductive,
+
+    /// Represents `#[rustc_comptime]`
+    RustcComptime(Span),
 
     /// Represents `#[rustc_confusables]`.
     RustcConfusables {
-        symbols: ThinVec<Symbol>,
-        // FIXME(jdonszelmann): remove when target validation code is moved
-        first_span: Span,
+        confusables: ThinVec<Symbol>,
     },
     /// Represents `#[rustc_const_stable]` and `#[rustc_const_unstable]`.
     RustcConstStability {
@@ -1140,7 +1402,7 @@ pub enum AttributeKind {
     },
 
     /// Represents `#[rustc_const_stable_indirect]`.
-    RustcConstStabilityIndirect,
+    RustcConstStableIndirect,
 
     /// Represents `#[rustc_conversion_suggestion]`
     RustcConversionSuggestion,
@@ -1148,23 +1410,24 @@ pub enum AttributeKind {
     /// Represents `#[rustc_deallocator]`
     RustcDeallocator,
 
-    /// Represents `#[rustc_def_path]`
-    RustcDefPath(Span),
-
     /// Represents `#[rustc_delayed_bug_from_inside_query]`
     RustcDelayedBugFromInsideQuery,
 
     /// Represents `#[rustc_deny_explicit_impl]`.
-    RustcDenyExplicitImpl(Span),
+    RustcDenyExplicitImpl,
 
     /// Represents `#[rustc_deprecated_safe_2024]`
-    RustcDeprecatedSafe2024 { suggestion: Symbol },
-
+    RustcDeprecatedSafe2024 {
+        suggestion: Symbol,
+    },
     /// Represents `#[rustc_diagnostic_item]`
     RustcDiagnosticItem(Symbol),
 
     /// Represents `#[rustc_do_not_const_check]`
     RustcDoNotConstCheck,
+
+    /// Represents `#[rustc_doc_primitive = ...]`
+    RustcDocPrimitive(Span, Symbol),
 
     /// Represents `#[rustc_dummy]`.
     RustcDummy,
@@ -1172,14 +1435,41 @@ pub enum AttributeKind {
     /// Represents `#[rustc_dump_def_parents]`
     RustcDumpDefParents,
 
+    /// Represents `#[rustc_dump_def_path]`
+    RustcDumpDefPath(Span),
+
+    /// Represents `#[rustc_dump_generics]`
+    RustcDumpGenerics,
+
+    /// Represents `#[rustc_dump_hidden_type_of_opaques]`
+    RustcDumpHiddenTypeOfOpaques,
+
+    /// Represents `#[rustc_dump_inferred_outlives]`
+    RustcDumpInferredOutlives,
+
     /// Represents `#[rustc_dump_item_bounds]`
     RustcDumpItemBounds,
+
+    /// Represents `#[rustc_dump_layout]`
+    RustcDumpLayout(ThinVec<RustcDumpLayoutKind>),
+
+    /// Represents `#[rustc_dump_object_lifetime_defaults]`.
+    RustcDumpObjectLifetimeDefaults,
 
     /// Represents `#[rustc_dump_predicates]`
     RustcDumpPredicates,
 
+    /// Represents `#[rustc_dump_symbol_name]`
+    RustcDumpSymbolName(Span),
+
     /// Represents `#[rustc_dump_user_args]`
     RustcDumpUserArgs,
+
+    /// Represents `#[rustc_dump_variances]`
+    RustcDumpVariances,
+
+    /// Represents `#[rustc_dump_variances_of_opaques]`
+    RustcDumpVariancesOfOpaques,
 
     /// Represents `#[rustc_dump_vtable]`
     RustcDumpVtable(Span),
@@ -1190,17 +1480,19 @@ pub enum AttributeKind {
     /// Represents `#[rustc_effective_visibility]`.
     RustcEffectiveVisibility,
 
+    /// Implementation detail of `#[eii]`
+    RustcEiiForeignItem,
+
     /// Represents `#[rustc_evaluate_where_clauses]`
     RustcEvaluateWhereClauses,
 
-    /// Represents `#[rustc_has_incoherent_inherent_impls]`
     RustcHasIncoherentInherentImpls,
-
-    /// Represents `#[rustc_hidden_type_of_opaques]`
-    RustcHiddenTypeOfOpaques,
 
     /// Represents `#[rustc_if_this_changed]`
     RustcIfThisChanged(Span, Option<Symbol>),
+
+    /// Represents `#[rustc_inherit_overflow_checks]`
+    RustcInheritOverflowChecks,
 
     /// Represents `#[rustc_insignificant_dtor]`
     RustcInsignificantDtor,
@@ -1211,20 +1503,16 @@ pub enum AttributeKind {
     /// Represents `#[rustc_intrinsic_const_stable_indirect]`
     RustcIntrinsicConstStableIndirect,
 
-    /// Represents `#[rustc_layout]`
-    RustcLayout(ThinVec<RustcLayoutType>),
-
-    /// Represents `#[rustc_layout_scalar_valid_range_end]`.
-    RustcLayoutScalarValidRangeEnd(Box<u128>, Span),
-
-    /// Represents `#[rustc_layout_scalar_valid_range_start]`.
-    RustcLayoutScalarValidRangeStart(Box<u128>, Span),
-
     /// Represents `#[rustc_legacy_const_generics]`
-    RustcLegacyConstGenerics { fn_indexes: ThinVec<(usize, Span)>, attr_span: Span },
+    RustcLegacyConstGenerics {
+        fn_indexes: ThinVec<(usize, Span)>,
+        attr_span: Span,
+    },
 
     /// Represents `#[rustc_lint_opt_deny_field_access]`
-    RustcLintOptDenyFieldAccess { lint_message: Symbol },
+    RustcLintOptDenyFieldAccess {
+        lint_message: Symbol,
+    },
 
     /// Represents `#[rustc_lint_opt_ty]`
     RustcLintOptTy,
@@ -1245,10 +1533,16 @@ pub enum AttributeKind {
     RustcMir(ThinVec<RustcMirKind>),
 
     /// Represents `#[rustc_must_implement_one_of]`
-    RustcMustImplementOneOf { attr_span: Span, fn_names: ThinVec<Ident> },
+    RustcMustImplementOneOf {
+        attr_span: Span,
+        fn_names: ThinVec<Ident>,
+    },
+
+    /// Represents `#[rustc_must_match_exhaustively]`
+    RustcMustMatchExhaustively(Span),
 
     /// Represents `#[rustc_never_returns_null_ptr]`
-    RustcNeverReturnsNullPointer,
+    RustcNeverReturnsNullPtr,
 
     /// Represents `#[rustc_never_type_options]`.
     RustcNeverTypeOptions {
@@ -1265,6 +1559,9 @@ pub enum AttributeKind {
     /// Represents `#[rustc_no_mir_inline]`
     RustcNoMirInline,
 
+    /// Represents `#[rustc_no_writable]`
+    RustcNoWritable,
+
     /// Represents `#[rustc_non_const_trait_method]`.
     RustcNonConstTraitMethod,
 
@@ -1275,25 +1572,23 @@ pub enum AttributeKind {
     RustcNounwind,
 
     /// Represents `#[rustc_objc_class]`
-    RustcObjcClass { classname: Symbol, span: Span },
+    RustcObjcClass {
+        classname: Symbol,
+    },
 
     /// Represents `#[rustc_objc_selector]`
-    RustcObjcSelector { methname: Symbol, span: Span },
-
-    /// Represents `#[rustc_object_lifetime_default]`.
-    RustcObjectLifetimeDefault,
+    RustcObjcSelector {
+        methname: Symbol,
+    },
 
     /// Represents `#[rustc_offload_kernel]`
     RustcOffloadKernel,
 
-    /// Represents `#[rustc_outlives]`
-    RustcOutlives,
-
     /// Represents `#[rustc_paren_sugar]`.
-    RustcParenSugar(Span),
+    RustcParenSugar,
 
     /// Represents `#[rustc_pass_by_value]` (used by the `rustc_pass_by_value` lint).
-    RustcPassByValue(Span),
+    RustcPassByValue,
 
     /// Represents `#[rustc_pass_indirectly_in_non_rustic_abis]`
     RustcPassIndirectlyInNonRusticAbis(Span),
@@ -1314,54 +1609,50 @@ pub enum AttributeKind {
     RustcRegions,
 
     /// Represents `#[rustc_reservation_impl]`
-    RustcReservationImpl(Span, Symbol),
+    RustcReservationImpl(Symbol),
 
     /// Represents `#[rustc_scalable_vector(N)]`
     RustcScalableVector {
         /// The base multiple of lanes that are in a scalable vector, if provided. `element_count`
         /// is not provided for representing tuple types.
         element_count: Option<u16>,
-        span: Span,
     },
 
     /// Represents `#[rustc_should_not_be_called_on_const_items]`
-    RustcShouldNotBeCalledOnConstItems(Span),
+    RustcShouldNotBeCalledOnConstItems,
 
     /// Represents `#[rustc_simd_monomorphize_lane_limit = "N"]`.
     RustcSimdMonomorphizeLaneLimit(Limit),
 
     /// Represents `#[rustc_skip_during_method_dispatch]`.
-    RustcSkipDuringMethodDispatch { array: bool, boxed_slice: bool, span: Span },
+    RustcSkipDuringMethodDispatch {
+        array: bool,
+        boxed_slice: bool,
+    },
 
     /// Represents `#[rustc_specialization_trait]`.
-    RustcSpecializationTrait(Span),
+    RustcSpecializationTrait,
 
     /// Represents `#[rustc_std_internal_symbol]`.
-    RustcStdInternalSymbol(Span),
+    RustcStdInternalSymbol,
 
     /// Represents `#[rustc_strict_coherence]`.
     RustcStrictCoherence(Span),
 
-    /// Represents `#[rustc_symbol_name]`
-    RustcSymbolName(Span),
+    /// Represents `#[rustc_test_entrypoint_marker]`
+    RustcTestEntrypointMarker,
 
     /// Represents `#[rustc_test_marker]`
     RustcTestMarker(Symbol),
 
     /// Represents `#[rustc_then_this_would_need]`
-    RustcThenThisWouldNeed(Span, ThinVec<Ident>),
+    RustcThenThisWouldNeed(ThinVec<Ident>),
 
     /// Represents `#[rustc_trivial_field_reads]`
     RustcTrivialFieldReads,
 
     /// Represents `#[rustc_unsafe_specialization_marker]`.
-    RustcUnsafeSpecializationMarker(Span),
-
-    /// Represents `#[rustc_variance]`
-    RustcVariance,
-
-    /// Represents `#[rustc_variance_of_opaques]`
-    RustcVarianceOfOpaques,
+    RustcUnsafeSpecializationMarker,
 
     /// Represents `#[sanitize]`
     ///
@@ -1376,7 +1667,12 @@ pub enum AttributeKind {
     },
 
     /// Represents `#[should_panic]`
-    ShouldPanic { reason: Option<Symbol>, span: Span },
+    ShouldPanic {
+        reason: Option<Symbol>,
+    },
+
+    /// Represents `#[splat]`
+    Splat(Span),
 
     /// Represents `#[stable]`, `#[unstable]` and `#[rustc_allowed_through_unstable_modules]`.
     Stability {
@@ -1387,7 +1683,11 @@ pub enum AttributeKind {
 
     /// Represents `#[target_feature(enable = "...")]` and
     /// `#[unsafe(force_target_feature(enable = "...")]`.
-    TargetFeature { features: ThinVec<(Symbol, Span)>, attr_span: Span, was_forced: bool },
+    TargetFeature {
+        features: ThinVec<(Symbol, Span)>,
+        attr_span: Span,
+        was_forced: bool,
+    },
 
     /// Represents `#![test_runner(path)]`
     TestRunner(Path),
@@ -1399,15 +1699,25 @@ pub enum AttributeKind {
     TrackCaller(Span),
 
     /// Represents `#[type_length_limit]`
-    TypeLengthLimit { attr_span: Span, limit_span: Span, limit: Limit },
+    TypeLengthLimit {
+        limit: Limit,
+    },
+
+    /// Represents `#[unroll]`
+    Unroll(UnrollAttr),
 
     /// Represents `#[unstable_feature_bound]`.
     UnstableFeatureBound(ThinVec<(Symbol, Span)>),
 
+    /// Represents all `#![unstable_removed(...)]` features
+    UnstableRemoved(ThinVec<UnstableRemovedFeature>),
+
     /// Represents `#[used]`
-    Used { used_by: UsedBy, span: Span },
+    Used {
+        used_by: UsedBy,
+    },
 
     /// Represents `#[windows_subsystem]`.
-    WindowsSubsystem(WindowsSubsystemKind, Span),
+    WindowsSubsystem(WindowsSubsystemKind),
     // tidy-alphabetical-end
 }

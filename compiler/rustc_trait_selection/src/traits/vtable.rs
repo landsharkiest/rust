@@ -6,7 +6,8 @@ use rustc_infer::traits::util::PredicateSet;
 use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
-    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Upcast, VtblEntry,
+    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
+    VtblEntry,
 };
 use rustc_span::DUMMY_SP;
 use smallvec::{SmallVec, smallvec};
@@ -123,6 +124,7 @@ fn prepare_vtable_segments_inner<'tcx, T>(
             let mut direct_super_traits_iter = tcx
                 .explicit_super_predicates_of(inner_most_trait_ref.def_id)
                 .iter_identity_copied()
+                .map(Unnormalized::skip_norm_wip)
                 .filter_map(move |(pred, _)| {
                     pred.instantiate_supertrait(tcx, ty::Binder::dummy(inner_most_trait_ref))
                         .as_trait_clause()
@@ -186,8 +188,7 @@ fn prepare_vtable_segments_inner<'tcx, T>(
 
 /// Turns option of iterator into an iterator (this is just flatten)
 fn maybe_iter<I: Iterator>(i: Option<I>) -> impl Iterator<Item = I::Item> {
-    // Flatten is bad perf-vise, we could probably implement a special case here that is better
-    i.into_iter().flatten()
+    i.into_flat_iter()
 }
 
 fn has_own_existential_vtable_entries(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
@@ -210,6 +211,11 @@ fn own_existential_vtable_entries_iter(
         debug!("own_existential_vtable_entry: trait_method={:?}", trait_method);
         let def_id = trait_method.def_id;
 
+        // Final methods should not be included in the vtable.
+        if trait_method.defaultness(tcx).is_final() {
+            return None;
+        }
+
         // Some methods cannot be called on an object; skip those.
         if !is_vtable_safe_method(tcx, trait_def_id, trait_method) {
             debug!("own_existential_vtable_entry: not vtable safe");
@@ -229,11 +235,7 @@ fn vtable_entries<'tcx>(
     trait_ref: ty::TraitRef<'tcx>,
 ) -> &'tcx [VtblEntry<'tcx>] {
     debug_assert!(!trait_ref.has_non_region_infer() && !trait_ref.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), trait_ref),
-        trait_ref,
-        "vtable trait ref should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), trait_ref);
 
     debug!("vtable_entries({:?})", trait_ref);
 
@@ -258,13 +260,15 @@ fn vtable_entries<'tcx>(
                     // FIXME: Is this normalize needed?
                     let args = tcx.normalize_erasing_regions(
                         ty::TypingEnv::fully_monomorphized(),
-                        GenericArgs::for_item(tcx, def_id, |param, _| match param.kind {
-                            GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
-                            GenericParamDefKind::Type { .. }
-                            | GenericParamDefKind::Const { .. } => {
-                                trait_ref.args[param.index as usize]
+                        Unnormalized::new_wip(GenericArgs::for_item(tcx, def_id, |param, _| {
+                            match param.kind {
+                                GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+                                GenericParamDefKind::Type { .. }
+                                | GenericParamDefKind::Const { .. } => {
+                                    trait_ref.args[param.index as usize]
+                                }
                             }
-                        }),
+                        })),
                     );
 
                     // It's possible that the method relies on where-clauses that
@@ -307,11 +311,7 @@ fn vtable_entries<'tcx>(
 // for `Supertrait`'s methods in the vtable of `Subtrait`.
 pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRef<'tcx>) -> usize {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), key),
-        key,
-        "vtable trait ref should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
     let ty::Dynamic(source, _) = *key.self_ty().kind() else {
         bug!();
@@ -371,11 +371,7 @@ pub(crate) fn supertrait_vtable_slot<'tcx>(
     ),
 ) -> Option<usize> {
     debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
-    debug_assert_eq!(
-        tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), key),
-        key,
-        "upcasting trait refs should be normalized"
-    );
+    tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), key);
 
     let (source, target) = key;
 

@@ -28,6 +28,7 @@ use libc::fstatat64;
     target_os = "fuchsia",
     target_os = "illumos",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "redox",
     target_os = "solaris",
     target_os = "vita",
@@ -45,6 +46,7 @@ use libc::readdir as readdir64;
     target_os = "l4re",
     target_os = "linux",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "redox",
     target_os = "solaris",
     target_os = "vita",
@@ -99,6 +101,28 @@ use crate::sys::weak::syscall;
 use crate::sys::weak::weak;
 use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner, cvt, cvt_r};
 use crate::{mem, ptr};
+
+// Used by rustc for checking the definitions of other function with the same symbol names
+//
+// See the `invalid_runtime_symbols_definitions` lint.
+#[cfg(not(test))]
+mod runtime_symbols {
+    use core::ffi::{c_char, c_int, c_size_t, c_ssize_t, c_void};
+
+    unsafe extern "C" {
+        #[lang = "open_fn"]
+        fn open(pathname: *const c_char, flags: c_int, ...) -> c_int;
+
+        #[lang = "read_fn"]
+        fn read(fd: c_int, buf: *mut c_void, count: c_size_t) -> c_ssize_t;
+
+        #[lang = "write_fn"]
+        fn write(fd: c_int, buf: *const c_void, count: c_size_t) -> c_ssize_t;
+
+        #[lang = "close_fn"]
+        fn close(fd: c_int) -> c_int;
+    }
+}
 
 pub struct File(FileDesc);
 
@@ -282,6 +306,7 @@ cfg_select! {
         target_os = "horizon",
         target_os = "vita",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vxworks",
     ) => {
         pub use crate::sys::fs::common::Dir;
@@ -339,7 +364,7 @@ fn get_path_from_fd(fd: c_int) -> Option<PathBuf> {
         // alternatives. If a better method is invented, it should be used
         // instead.
         let mut buf = vec![0; libc::PATH_MAX as usize];
-        let n = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_ptr()) };
+        let n = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
         if n == -1 {
             cfg_select! {
                 target_os = "netbsd" => {
@@ -375,7 +400,7 @@ fn get_path_from_fd(fd: c_int) -> Option<PathBuf> {
     #[cfg(target_os = "vxworks")]
     fn get_path(fd: c_int) -> Option<PathBuf> {
         let mut buf = vec![0; libc::PATH_MAX as usize];
-        let n = unsafe { libc::ioctl(fd, libc::FIOGETNAME, buf.as_ptr()) };
+        let n = unsafe { libc::ioctl(fd, libc::FIOGETNAME, buf.as_mut_ptr()) };
         if n == -1 {
             return None;
         }
@@ -410,6 +435,7 @@ fn get_path_from_fd(fd: c_int) -> Option<PathBuf> {
     target_os = "illumos",
     target_os = "linux",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "redox",
     target_os = "solaris",
     target_os = "vita",
@@ -436,6 +462,7 @@ pub struct DirEntry {
     target_os = "illumos",
     target_os = "linux",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "redox",
     target_os = "solaris",
     target_os = "vita",
@@ -448,6 +475,7 @@ struct dirent64_min {
         target_os = "illumos",
         target_os = "aix",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vita",
     )))]
     d_type: u8,
@@ -462,6 +490,7 @@ struct dirent64_min {
     target_os = "illumos",
     target_os = "linux",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "redox",
     target_os = "solaris",
     target_os = "vita",
@@ -599,19 +628,25 @@ impl FileAttr {
 #[cfg(target_os = "aix")]
 impl FileAttr {
     pub fn modified(&self) -> io::Result<SystemTime> {
-        SystemTime::new(self.stat.st_mtime.tv_sec as i64, self.stat.st_mtime.tv_nsec as i64)
+        SystemTime::new(self.stat.st_mtim.tv_sec as i64, self.stat.st_mtim.tv_nsec as i64)
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        SystemTime::new(self.stat.st_atime.tv_sec as i64, self.stat.st_atime.tv_nsec as i64)
+        SystemTime::new(self.stat.st_atim.tv_sec as i64, self.stat.st_atim.tv_nsec as i64)
     }
 
     pub fn created(&self) -> io::Result<SystemTime> {
-        SystemTime::new(self.stat.st_ctime.tv_sec as i64, self.stat.st_ctime.tv_nsec as i64)
+        SystemTime::new(self.stat.st_ctim.tv_sec as i64, self.stat.st_ctim.tv_nsec as i64)
     }
 }
 
-#[cfg(not(any(target_os = "netbsd", target_os = "nto", target_os = "aix", target_os = "wasi")))]
+#[cfg(not(any(
+    target_os = "netbsd",
+    target_os = "nto",
+    target_os = "qnx",
+    target_os = "aix",
+    target_os = "wasi"
+)))]
 impl FileAttr {
     #[cfg(not(any(
         target_os = "vxworks",
@@ -634,7 +669,7 @@ impl FileAttr {
     }
 
     #[cfg(any(
-        target_os = "vxworks",
+        all(target_os = "vxworks", vxworks_lt_25_09),
         target_os = "espidf",
         target_os = "vita",
         target_os = "rtems",
@@ -643,7 +678,12 @@ impl FileAttr {
         SystemTime::new(self.stat.st_mtime as i64, 0)
     }
 
-    #[cfg(any(target_os = "horizon", target_os = "hurd", target_os = "nuttx"))]
+    #[cfg(any(
+        target_os = "horizon",
+        target_os = "hurd",
+        target_os = "nuttx",
+        all(target_os = "vxworks", not(vxworks_lt_25_09))
+    ))]
     pub fn modified(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_mtim.tv_sec as i64, self.stat.st_mtim.tv_nsec as i64)
     }
@@ -669,7 +709,7 @@ impl FileAttr {
     }
 
     #[cfg(any(
-        target_os = "vxworks",
+        all(target_os = "vxworks", vxworks_lt_25_09),
         target_os = "espidf",
         target_os = "vita",
         target_os = "rtems"
@@ -678,7 +718,12 @@ impl FileAttr {
         SystemTime::new(self.stat.st_atime as i64, 0)
     }
 
-    #[cfg(any(target_os = "horizon", target_os = "hurd", target_os = "nuttx"))]
+    #[cfg(any(
+        target_os = "horizon",
+        target_os = "hurd",
+        target_os = "nuttx",
+        all(target_os = "vxworks", not(vxworks_lt_25_09))
+    ))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_atim.tv_sec as i64, self.stat.st_atim.tv_nsec as i64)
     }
@@ -726,7 +771,7 @@ impl FileAttr {
     }
 }
 
-#[cfg(any(target_os = "nto", target_os = "wasi"))]
+#[cfg(any(target_os = "nto", target_os = "qnx", target_os = "wasi"))]
 impl FileAttr {
     pub fn modified(&self) -> io::Result<SystemTime> {
         SystemTime::new(self.stat.st_mtim.tv_sec, self.stat.st_mtim.tv_nsec.into())
@@ -844,6 +889,7 @@ impl Iterator for ReadDir {
         target_os = "illumos",
         target_os = "linux",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "redox",
         target_os = "solaris",
         target_os = "vita",
@@ -917,6 +963,7 @@ impl Iterator for ReadDir {
                         target_os = "illumos",
                         target_os = "aix",
                         target_os = "nto",
+                        target_os = "qnx",
                     )))]
                     d_type: (*entry_ptr).d_type as u8,
                 };
@@ -942,6 +989,7 @@ impl Iterator for ReadDir {
         target_os = "illumos",
         target_os = "linux",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "redox",
         target_os = "solaris",
         target_os = "vita",
@@ -1005,6 +1053,7 @@ impl Drop for DirStream {
             miri,
             target_os = "redox",
             target_os = "nto",
+            target_os = "qnx",
             target_os = "vita",
             target_os = "hurd",
             target_os = "espidf",
@@ -1080,7 +1129,7 @@ impl DirEntry {
             target_os = "illumos",
             target_vendor = "apple",
         )),
-        miri
+        miri // no dirfd on Miri
     ))]
     pub fn metadata(&self) -> io::Result<FileAttr> {
         run_path_with_cstr(&self.path(), &lstat)
@@ -1093,6 +1142,7 @@ impl DirEntry {
         target_os = "vxworks",
         target_os = "aix",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vita",
     ))]
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -1106,6 +1156,7 @@ impl DirEntry {
         target_os = "vxworks",
         target_os = "aix",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vita",
     )))]
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -1136,6 +1187,7 @@ impl DirEntry {
         target_os = "l4re",
         target_os = "linux",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "redox",
         target_os = "rtems",
         target_os = "solaris",
@@ -1195,6 +1247,7 @@ impl DirEntry {
         target_os = "redox",
         target_os = "aix",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vita",
         target_os = "hurd",
         target_os = "wasi",
@@ -1212,6 +1265,7 @@ impl DirEntry {
         target_os = "redox",
         target_os = "aix",
         target_os = "nto",
+        target_os = "qnx",
         target_os = "vita",
         target_os = "hurd",
         target_os = "wasi",
@@ -1409,6 +1463,7 @@ impl File {
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "nto",
+            target_os = "qnx",
             target_os = "hurd",
         ))]
         unsafe fn os_datasync(fd: c_int) -> c_int {
@@ -1423,6 +1478,7 @@ impl File {
             target_os = "netbsd",
             target_os = "openbsd",
             target_os = "nto",
+            target_os = "qnx",
             target_os = "hurd",
             target_vendor = "apple",
         )))]
@@ -1431,257 +1487,146 @@ impl File {
         }
     }
 
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    ))]
     pub fn lock(&self) -> io::Result<()> {
-        cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX) })?;
-        return Ok(());
+        cfg_select! {
+            any(
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "hurd",
+                target_os = "linux",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "illumos",
+                target_os = "aix",
+                target_os = "android",
+                target_vendor = "apple",
+            ) => {
+                cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX) })?;
+                return Ok(());
+            }
+            _ => {
+                Err(io::const_error!(io::ErrorKind::Unsupported, "lock() not supported"))
+            }
+        }
     }
 
-    #[cfg(target_os = "solaris")]
-    pub fn lock(&self) -> io::Result<()> {
-        let mut flock: libc::flock = unsafe { mem::zeroed() };
-        flock.l_type = libc::F_WRLCK as libc::c_short;
-        flock.l_whence = libc::SEEK_SET as libc::c_short;
-        cvt(unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETLKW, &flock) })?;
-        Ok(())
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    )))]
-    pub fn lock(&self) -> io::Result<()> {
-        Err(io::const_error!(io::ErrorKind::Unsupported, "lock() not supported"))
-    }
-
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    ))]
     pub fn lock_shared(&self) -> io::Result<()> {
-        cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH) })?;
-        return Ok(());
+        cfg_select! {
+            any(
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "hurd",
+                target_os = "linux",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "illumos",
+                target_os = "aix",
+                target_os = "android",
+                target_vendor = "apple",
+            ) => {
+                cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH) })?;
+                return Ok(());
+            }
+            _ => {
+                Err(io::const_error!(io::ErrorKind::Unsupported, "lock_shared() not supported"))
+            }
+        }
     }
 
-    #[cfg(target_os = "solaris")]
-    pub fn lock_shared(&self) -> io::Result<()> {
-        let mut flock: libc::flock = unsafe { mem::zeroed() };
-        flock.l_type = libc::F_RDLCK as libc::c_short;
-        flock.l_whence = libc::SEEK_SET as libc::c_short;
-        cvt(unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETLKW, &flock) })?;
-        Ok(())
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    )))]
-    pub fn lock_shared(&self) -> io::Result<()> {
-        Err(io::const_error!(io::ErrorKind::Unsupported, "lock_shared() not supported"))
-    }
-
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    ))]
     pub fn try_lock(&self) -> Result<(), TryLockError> {
-        let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) });
-        if let Err(err) = result {
-            if err.kind() == io::ErrorKind::WouldBlock {
-                Err(TryLockError::WouldBlock)
-            } else {
-                Err(TryLockError::Error(err))
+        cfg_select! {
+            any(
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "hurd",
+                target_os = "linux",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "illumos",
+                target_os = "aix",
+                target_os = "android",
+                target_vendor = "apple",
+            ) => {
+                let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) });
+                if let Err(err) = result {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        Err(TryLockError::WouldBlock)
+                    } else {
+                        Err(TryLockError::Error(err))
+                    }
+                } else {
+                    Ok(())
+                }
             }
-        } else {
-            Ok(())
+            _ => {
+                Err(TryLockError::Error(io::const_error!(
+                    io::ErrorKind::Unsupported,
+                    "try_lock() not supported"
+                )))
+            }
         }
     }
 
-    #[cfg(target_os = "solaris")]
-    pub fn try_lock(&self) -> Result<(), TryLockError> {
-        let mut flock: libc::flock = unsafe { mem::zeroed() };
-        flock.l_type = libc::F_WRLCK as libc::c_short;
-        flock.l_whence = libc::SEEK_SET as libc::c_short;
-        let result = cvt(unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETLK, &flock) });
-        if let Err(err) = result {
-            if err.kind() == io::ErrorKind::WouldBlock {
-                Err(TryLockError::WouldBlock)
-            } else {
-                Err(TryLockError::Error(err))
-            }
-        } else {
-            Ok(())
-        }
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    )))]
-    pub fn try_lock(&self) -> Result<(), TryLockError> {
-        Err(TryLockError::Error(io::const_error!(
-            io::ErrorKind::Unsupported,
-            "try_lock() not supported"
-        )))
-    }
-
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    ))]
     pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
-        let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) });
-        if let Err(err) = result {
-            if err.kind() == io::ErrorKind::WouldBlock {
-                Err(TryLockError::WouldBlock)
-            } else {
-                Err(TryLockError::Error(err))
+        cfg_select! {
+                any(
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "hurd",
+                target_os = "linux",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "illumos",
+                target_os = "aix",
+                target_os = "android",
+                target_vendor = "apple",
+            ) => {
+                let result = cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) });
+                if let Err(err) = result {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        Err(TryLockError::WouldBlock)
+                    } else {
+                        Err(TryLockError::Error(err))
+                    }
+                } else {
+                    Ok(())
+                }
             }
-        } else {
-            Ok(())
+            _ => {
+                Err(TryLockError::Error(io::const_error!(
+                    io::ErrorKind::Unsupported,
+                    "try_lock_shared() not supported"
+                )))
+            }
         }
     }
 
-    #[cfg(target_os = "solaris")]
-    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
-        let mut flock: libc::flock = unsafe { mem::zeroed() };
-        flock.l_type = libc::F_RDLCK as libc::c_short;
-        flock.l_whence = libc::SEEK_SET as libc::c_short;
-        let result = cvt(unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETLK, &flock) });
-        if let Err(err) = result {
-            if err.kind() == io::ErrorKind::WouldBlock {
-                Err(TryLockError::WouldBlock)
-            } else {
-                Err(TryLockError::Error(err))
+    pub fn unlock(&self) -> io::Result<()> {
+        cfg_select! {
+            any(
+                target_os = "freebsd",
+                target_os = "fuchsia",
+                target_os = "hurd",
+                target_os = "linux",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "cygwin",
+                target_os = "illumos",
+                target_os = "aix",
+                target_os = "android",
+                target_vendor = "apple",
+            ) => {
+                cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_UN) })?;
+                return Ok(());
             }
-        } else {
-            Ok(())
+            _ => {
+                Err(io::const_error!(io::ErrorKind::Unsupported, "unlock() not supported"))
+            }
         }
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    )))]
-    pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
-        Err(TryLockError::Error(io::const_error!(
-            io::ErrorKind::Unsupported,
-            "try_lock_shared() not supported"
-        )))
-    }
-
-    #[cfg(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    ))]
-    pub fn unlock(&self) -> io::Result<()> {
-        cvt(unsafe { libc::flock(self.as_raw_fd(), libc::LOCK_UN) })?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "solaris")]
-    pub fn unlock(&self) -> io::Result<()> {
-        let mut flock: libc::flock = unsafe { mem::zeroed() };
-        flock.l_type = libc::F_UNLCK as libc::c_short;
-        flock.l_whence = libc::SEEK_SET as libc::c_short;
-        cvt(unsafe { libc::fcntl(self.as_raw_fd(), libc::F_SETLKW, &flock) })?;
-        Ok(())
-    }
-
-    #[cfg(not(any(
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "hurd",
-        target_os = "linux",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix",
-        target_vendor = "apple",
-    )))]
-    pub fn unlock(&self) -> io::Result<()> {
-        Err(io::const_error!(io::ErrorKind::Unsupported, "unlock() not supported"))
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
@@ -1707,11 +1652,11 @@ impl File {
         self.0.read_at(buf, offset)
     }
 
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         self.0.read_buf(cursor)
     }
 
-    pub fn read_buf_at(&self, cursor: BorrowedCursor<'_>, offset: u64) -> io::Result<()> {
+    pub fn read_buf_at(&self, cursor: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
         self.0.read_buf_at(cursor, offset)
     }
 
@@ -1862,7 +1807,12 @@ fn file_time_to_timespec(time: Option<SystemTime>) -> io::Result<libc::timespec>
             io::ErrorKind::InvalidInput,
             "timestamp is too small to set as a file time",
         )),
-        None => Ok(libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ }),
+        None => Ok({
+            let mut ts = libc::timespec::default();
+            ts.tv_sec = 0;
+            ts.tv_nsec = libc::UTIME_OMIT as _;
+            ts
+        }),
     }
 }
 
@@ -1998,7 +1948,7 @@ impl fmt::Debug for File {
 // Format in octal, followed by the mode format used in `ls -l`.
 //
 // References:
-//   https://pubs.opengroup.org/onlinepubs/009696899/utilities/ls.html
+//   https://pubs.opengroup.org/onlinepubs/9799919799/utilities/ls.html
 //   https://www.gnu.org/software/libc/manual/html_node/Testing-File-Type.html
 //   https://www.gnu.org/software/libc/manual/html_node/Permission-Bits.html
 //
@@ -2340,7 +2290,7 @@ mod cfm {
         fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize> {
             self.0.read_vectored(bufs)
         }
-        fn read_buf(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
+        fn read_buf(&mut self, cursor: BorrowedCursor<'_, u8>) -> Result<()> {
             self.0.read_buf(cursor)
         }
         #[inline]
@@ -2501,6 +2451,7 @@ pub use remove_dir_impl::remove_dir_all;
     target_os = "horizon",
     target_os = "vita",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "vxworks",
     miri
 ))]
@@ -2515,6 +2466,7 @@ mod remove_dir_impl {
     target_os = "horizon",
     target_os = "vita",
     target_os = "nto",
+    target_os = "qnx",
     target_os = "vxworks",
     miri
 )))]

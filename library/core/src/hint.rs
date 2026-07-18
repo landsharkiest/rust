@@ -514,7 +514,7 @@ pub const fn black_box<T>(dummy: T) -> T {
 /// macro_rules! make_error {
 ///     ($($args:expr),*) => {
 ///         core::hint::must_use({
-///             let error = $crate::make_error(core::format_args!($($args),*));
+///             let error = make_error(core::format_args!($($args),*));
 ///             error
 ///         })
 ///     };
@@ -775,9 +775,12 @@ pub const fn unlikely(b: bool) -> bool {
 ///     }
 /// }
 /// ```
-#[stable(feature = "cold_path", since = "CURRENT_RUSTC_VERSION")]
-#[rustc_const_stable(feature = "cold_path", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "cold_path", since = "1.95.0")]
+#[rustc_const_stable(feature = "cold_path", since = "1.95.0")]
 #[inline(always)]
+// Even if for some reason the cold_path intrinsic is not visible to codegen, the coldness will
+// ensure that branches this is in are still known to be cold.
+#[cold]
 pub const fn cold_path() {
     crate::intrinsics::cold_path()
 }

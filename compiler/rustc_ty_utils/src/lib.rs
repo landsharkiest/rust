@@ -5,12 +5,11 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(assert_matches))]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(iterator_try_collect)]
 #![feature(never_type)]
+#![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
 use rustc_middle::query::Providers;
@@ -19,7 +18,7 @@ mod abi;
 mod assoc;
 mod common_traits;
 mod consts;
-mod errors;
+mod diagnostics;
 mod implied_bounds;
 mod instance;
 mod layout;

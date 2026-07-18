@@ -7,11 +7,11 @@ use super::abi::ReprOptions;
 use super::mir::{Body, Mutability, Safety};
 use super::{DefId, Error, Symbol, with};
 use crate::abi::{FnAbi, Layout};
-use crate::crate_def::{CrateDef, CrateDefItems, CrateDefType};
+use crate::crate_def::{CrateDef, CrateDefType};
 use crate::mir::alloc::{AllocId, read_target_int, read_target_uint};
-use crate::mir::mono::StaticDef;
+use crate::mir::mono::{Instance, StaticDef};
 use crate::target::MachineInfo;
-use crate::{Filename, IndexedVal, Opaque, ThreadLocalIndex};
+use crate::{AssocItems, Filename, IndexedVal, Opaque, ThreadLocalIndex};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub struct Ty(usize, ThreadLocalIndex);
@@ -109,7 +109,9 @@ impl Ty {
 /// Represents a pattern in the type system
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Pattern {
-    Range { start: Option<TyConst>, end: Option<TyConst>, include_end: bool },
+    Range { start: TyConst, end: TyConst, include_end: bool },
+    NotNull,
+    Or(Vec<Pattern>),
 }
 
 /// Represents a constant in the type system
@@ -710,10 +712,30 @@ impl FnDef {
         self.as_intrinsic().is_some()
     }
 
+    /// Get the constness of this function definition.
+    pub fn constness(&self) -> Constness {
+        with(|cx| cx.constness(*self))
+    }
+
+    /// Get the asyncness of this function definition.
+    pub fn asyncness(&self) -> Asyncness {
+        with(|cx| cx.asyncness(*self))
+    }
+
     /// Get the function signature for this function definition.
     pub fn fn_sig(&self) -> PolyFnSig {
         let kind = self.ty().kind();
         kind.fn_sig().unwrap()
+    }
+
+    /// Get the generics of this function definition.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
+    }
+
+    /// Get the associated item information if this function is one.
+    pub fn associated_item(&self) -> Option<AssocItem> {
+        with(|cx| cx.associated_item(self.0))
     }
 }
 
@@ -851,6 +873,16 @@ impl AdtDef {
     pub fn discriminant_for_variant(&self, idx: VariantIdx) -> Discr {
         with(|cx| cx.adt_discr_for_variant(*self, idx))
     }
+
+    /// Get the generics of this ADT definition.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
+    }
+
+    /// Retrieve the inherent implementations for this ADT.
+    pub fn inherent_impls(&self) -> Vec<ImplDef> {
+        with(|cx| cx.inherent_impls(*self))
+    }
 }
 
 pub struct Discr {
@@ -862,17 +894,11 @@ pub struct Discr {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct VariantDef {
     /// The variant index.
-    ///
-    /// ## Warning
-    /// Do not access this field directly!
-    pub idx: VariantIdx,
+    pub(crate) idx: VariantIdx,
     /// The data type where this variant comes from.
     /// For now, we use this to retrieve information about the variant itself so we don't need to
     /// cache more information.
-    ///
-    /// ## Warning
-    /// Do not access this field directly!
-    pub adt_def: AdtDef,
+    pub(crate) adt_def: AdtDef,
 }
 
 impl VariantDef {
@@ -889,31 +915,23 @@ impl VariantDef {
     pub fn fields(&self) -> Vec<FieldDef> {
         with(|cx| cx.variant_fields(*self))
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct FieldDef {
-    /// The field definition.
-    ///
-    /// ## Warning
-    /// Do not access this field directly! This is public for the compiler to have access to it.
-    pub def: DefId,
-
-    /// The field name.
-    pub name: Symbol,
-}
-
-impl FieldDef {
-    /// Retrieve the type of this field instantiating and normalizing it with the given arguments.
-    ///
-    /// This will assume the type can be instantiated with these arguments.
-    pub fn ty_with_args(&self, args: &GenericArgs) -> Ty {
-        with(|cx| cx.def_ty_with_args(self.def, args))
+    /// Returns the variant index.
+    pub fn idx(&self) -> VariantIdx {
+        self.idx
     }
 
-    /// Retrieve the type of this field.
-    pub fn ty(&self) -> Ty {
-        with(|cx| cx.def_ty(self.def))
+    /// Returns the `AdtDef` which this variant comes from.
+    pub fn adt_def(&self) -> AdtDef {
+        self.adt_def
+    }
+}
+
+crate_def_with_ty! {
+    #[derive(Serialize)]
+    pub FieldDef {
+        /// The field name.
+        pub name: Symbol,
     }
 }
 
@@ -952,13 +970,13 @@ crate_def! {
     pub TraitDef;
 }
 
-impl_crate_def_items! {
-    TraitDef;
-}
-
 impl TraitDef {
     pub fn declaration(trait_def: &TraitDef) -> TraitDecl {
         with(|cx| cx.trait_decl(trait_def))
+    }
+
+    pub fn associated_items(&self) -> AssocItems {
+        with(|cx| cx.associated_items(self.def_id()))
     }
 }
 
@@ -972,20 +990,25 @@ crate_def_with_ty! {
     pub ConstDef;
 }
 
-crate_def! {
+crate_def_with_ty! {
     /// A trait impl definition.
     #[derive(Serialize)]
     pub ImplDef;
-}
-
-impl_crate_def_items! {
-    ImplDef;
 }
 
 impl ImplDef {
     /// Retrieve information about this implementation.
     pub fn trait_impl(&self) -> ImplTrait {
         with(|cx| cx.trait_impl(self))
+    }
+
+    pub fn associated_items(&self) -> AssocItems {
+        with(|cx| cx.associated_items(self.def_id()))
+    }
+
+    /// Get the generics of this implementation.
+    pub fn generics_of(&self) -> Generics {
+        with(|cx| cx.generics_of(self.0))
     }
 }
 
@@ -1112,6 +1135,30 @@ impl FnSig {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Constness {
+    Const { always: bool },
+    NotConst,
+}
+
+impl Constness {
+    pub fn is_const(self) -> bool {
+        matches!(self, Constness::Const { always: false })
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Asyncness {
+    Async,
+    NotAsync,
+}
+
+impl Asyncness {
+    pub fn is_async(self) -> bool {
+        matches!(self, Asyncness::Async)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub enum Abi {
     Rust,
@@ -1140,8 +1187,10 @@ pub enum Abi {
     RiscvInterruptM,
     RiscvInterruptS,
     RustPreserveNone,
+    RustTail,
     RustInvalid,
     Custom,
+    Swift,
 }
 
 /// A binder represents a possibly generic type and its bound vars.
@@ -1449,6 +1498,18 @@ impl TraitRef {
         };
         self_ty
     }
+
+    /// Retrieve all vtable entries.
+    pub fn vtable_entries(&self) -> Vec<VtblEntry> {
+        with(|cx| cx.vtable_entries(self))
+    }
+
+    /// Returns the vtable entry at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn vtable_entry(&self, idx: usize) -> Option<VtblEntry> {
+        with(|cx| cx.vtable_entry(self, idx))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1490,7 +1551,6 @@ pub enum PredicateKind {
     Coerce(CoercePredicate),
     ConstEquate(TyConst, TyConst),
     Ambiguous,
-    AliasRelate(TermKind, TermKind, AliasRelationDirection),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1521,12 +1581,6 @@ pub struct SubtypePredicate {
 pub struct CoercePredicate {
     pub a: Ty,
     pub b: Ty,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub enum AliasRelationDirection {
-    Equate,
-    Subtype,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1586,7 +1640,8 @@ macro_rules! serialize_index_impl {
         }
     };
 }
-pub(crate) use {index_impl, serialize_index_impl};
+pub(crate) use index_impl;
+pub(crate) use serialize_index_impl;
 
 index_impl!(TyConstId);
 index_impl!(MirConstId);
@@ -1663,4 +1718,20 @@ impl AssocItem {
     pub fn is_impl_trait_in_trait(&self) -> bool {
         matches!(self.kind, AssocKind::Type { data: AssocTypeData::Rpitit(_) })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum VtblEntry {
+    /// destructor of this type (used in vtable header)
+    MetadataDropInPlace,
+    /// layout size of this type (used in vtable header)
+    MetadataSize,
+    /// layout align of this type (used in vtable header)
+    MetadataAlign,
+    /// non-dispatchable associated function that is excluded from trait object
+    Vacant,
+    /// dispatchable associated function
+    Method(Instance),
+    /// pointer to a separate supertrait vtable, can be used by trait upcasting coercion
+    TraitVPtr(TraitRef),
 }

@@ -61,8 +61,6 @@ fn foo(baz: Baz) {
             en Baz
             en Result
             md core
-            ev Err
-            ev Ok
             bn Baz::Bar Baz::Bar$0
             bn Baz::Foo Baz::Foo$0
             bn Err(…)    Err($1)$0
@@ -89,10 +87,6 @@ fn foo(baz: Baz) {
             en Baz
             en Result
             md core
-            ev Bar
-            ev Err
-            ev Foo
-            ev Ok
             bn Bar        Bar$0
             bn Err(…) Err($1)$0
             bn Foo        Foo$0
@@ -163,6 +157,8 @@ fn foo(f: Struct) {
 fn in_functional_update() {
     cov_mark::check!(functional_update);
 
+    // FIXME: This should filter out all completions that do not have the type `Foo`
+    // I think maybe ranking by type match is enough
     check(
         r#"
 //- minicore:default
@@ -182,7 +178,7 @@ fn main() {
             fn main()                          fn()
             lc foo                              Foo
             lc thing                            i32
-            md core
+            md core::
             st Foo                              Foo
             st Foo {…} Foo { foo1: u32, foo2: u32 }
             tt Default
@@ -216,7 +212,6 @@ fn main() {
 #[test]
 fn functional_update_no_dot() {
     cov_mark::check!(functional_update_field);
-    // FIXME: This should filter out all completions that do not have the type `Foo`
     check(
         r#"
 //- minicore:default
@@ -236,6 +231,23 @@ fn main() {
             fd foo1             u32
             fd foo2             u32
         "#]],
+    );
+}
+
+#[test]
+fn in_own_default_impl() {
+    cov_mark::check!(functional_update_field);
+    check(
+        r#"
+    //- minicore:default
+    struct Foo { foo1: u32, foo2: u32 }
+    impl Default for Foo {
+        fn default() -> Self { Self { foo1: 0, $0 }
+    }
+    "#,
+        expect![[r#"
+                fd foo2 u32
+            "#]],
     );
 }
 
@@ -277,6 +289,48 @@ fn main() {
     let thing = 1;
     let foo = Foo { foo1: 0, foo2: 0 };
     let foo2 = Foo { thing, $0 ..Default::default() }
+}
+"#,
+        expect![[r#"
+            fd foo1 u32
+            fd foo2 u32
+        "#]],
+    );
+}
+
+#[test]
+fn functional_update_non_last() {
+    check(
+        r#"
+//- minicore:default
+struct Foo { foo1: u32, foo2: u32 }
+impl Default for Foo {
+    fn default() -> Self { loop {} }
+}
+
+fn main() {
+    let thing = 1;
+    let foo = Foo { foo1: 0, foo2: 0 };
+    let foo2 = Foo { $0 thing }
+}
+"#,
+        expect![[r#"
+            fd foo1 u32
+            fd foo2 u32
+        "#]],
+    );
+    check(
+        r#"
+//- minicore:default
+struct Foo { foo1: u32, foo2: u32 }
+impl Default for Foo {
+    fn default() -> Self { loop {} }
+}
+
+fn main() {
+    let thing = 1;
+    let foo = Foo { foo1: 0, foo2: 0 };
+    let foo2 = Foo { $0thing }
 }
 "#,
         expect![[r#"

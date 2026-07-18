@@ -11,10 +11,6 @@ expression: test --skip=coverage
 [Test] test::Crashes
     targets: [aarch64-unknown-linux-gnu]
     - Suite(test::tests/crashes)
-[Test] test::Coverage
-    targets: [aarch64-unknown-linux-gnu]
-    - Set({test::coverage-map})
-    - Set({test::coverage-run})
 [Test] test::MirOpt
     targets: [aarch64-unknown-linux-gnu]
     - Suite(test::tests/mir-opt)
@@ -128,7 +124,6 @@ expression: test --skip=coverage
     - Set({test::compiler/rustc_public})
     - Set({test::compiler/rustc_public_bridge})
     - Set({test::compiler/rustc_query_impl})
-    - Set({test::compiler/rustc_query_system})
     - Set({test::compiler/rustc_resolve})
     - Set({test::compiler/rustc_sanitizers})
     - Set({test::compiler/rustc_serialize})
@@ -146,8 +141,7 @@ expression: test --skip=coverage
     - Set({test::compiler/rustc_windows_rc})
 [Test] test::CrateRustdoc
     targets: [x86_64-unknown-linux-gnu]
-    - Set({test::src/librustdoc})
-    - Set({test::src/tools/rustdoc})
+    - Set({test::src/librustdoc, test::src/tools/rustdoc})
 [Test] test::CrateRustdocJsonTypes
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/rustdoc-json-types})
@@ -182,6 +176,9 @@ expression: test --skip=coverage
 [Test] test::RustcBook
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/doc/rustc})
+[Test] test::StdarchVerify
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({test::library/stdarch/crates/stdarch-verify})
 [Test] test::RustdocJSStd
     targets: [x86_64-unknown-linux-gnu]
     - Suite(test::tests/rustdoc-js-std)

@@ -214,13 +214,13 @@ fn check_unexpected_extension(check: &mut RunningCheck, file_path: &Path, ext: &
         "stdout", // expected stdout file, corresponds to a rs file
         "fixed",  // expected source file after applying fixes
         "md",     // test directory descriptions
-        "ftl",    // translation tests
     ];
 
     const EXTENSION_EXCEPTION_PATHS: &[&str] = &[
         "tests/ui/asm/named-asm-labels.s", // loading an external asm file to test named labels lint
         "tests/ui/asm/normalize-offsets-for-crlf.s", // loading an external asm file to test CRLF normalization
         "tests/ui/codegen/mismatched-data-layout.json", // testing mismatched data layout w/ custom targets
+        "tests/ui/codegen/custom-target-invalid-llvm-target.json", // testing invalid custom targets
         "tests/ui/check-cfg/my-awesome-platform.json",  // testing custom targets with cfgs
         "tests/ui/argfile/commandline-argfile-badutf8.args", // passing args via a file
         "tests/ui/argfile/commandline-argfile.args",    // passing args via a file

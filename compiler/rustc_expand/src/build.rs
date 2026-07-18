@@ -2,11 +2,10 @@ use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::util::literal;
 use rustc_ast::{
-    self as ast, AnonConst, AttrItem, AttrVec, BlockCheckMode, Expr, LocalKind, MatchKind,
-    MgcaDisambiguation, PatKind, UnOp, attr, token, tokenstream,
+    self as ast, AnonConst, AttrItem, AttrVec, BlockCheckMode, Expr, LocalKind, MatchKind, PatKind,
+    UnOp, attr, token, tokenstream,
 };
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, Spanned, Symbol, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 
 use crate::base::ExtCtxt;
@@ -49,7 +48,7 @@ impl<'a> ExtCtxt<'a> {
             id: ast::DUMMY_NODE_ID,
             args,
         });
-        ast::Path { span, segments, tokens: None }
+        ast::Path { span, segments }
     }
 
     pub fn macro_call(
@@ -74,7 +73,7 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn ty(&self, span: Span, kind: ast::TyKind) -> Box<ast::Ty> {
-        Box::new(ast::Ty { id: ast::DUMMY_NODE_ID, span, kind, tokens: None })
+        Box::new(ast::Ty { id: ast::DUMMY_NODE_ID, span, kind })
     }
 
     pub fn ty_infer(&self, span: Span) -> Box<ast::Ty> {
@@ -101,7 +100,6 @@ impl<'a> ExtCtxt<'a> {
                 attrs: AttrVec::new(),
                 tokens: None,
             }),
-            mgca_disambiguation: MgcaDisambiguation::Direct,
         }
     }
 
@@ -289,13 +287,7 @@ impl<'a> ExtCtxt<'a> {
         )
     }
     pub fn block(&self, span: Span, stmts: ThinVec<ast::Stmt>) -> Box<ast::Block> {
-        Box::new(ast::Block {
-            stmts,
-            id: ast::DUMMY_NODE_ID,
-            rules: BlockCheckMode::Default,
-            span,
-            tokens: None,
-        })
+        Box::new(ast::Block { stmts, id: ast::DUMMY_NODE_ID, rules: BlockCheckMode::Default, span })
     }
 
     pub fn expr(&self, span: Span, kind: ast::ExprKind) -> Box<ast::Expr> {
@@ -316,7 +308,7 @@ impl<'a> ExtCtxt<'a> {
         self.expr_path(self.path_ident(span, id))
     }
     pub fn expr_self(&self, span: Span) -> Box<ast::Expr> {
-        self.expr_ident(span, Ident::with_dummy_span(kw::SelfLower))
+        self.expr_ident(span, Ident::new(kw::SelfLower, span))
     }
 
     pub fn expr_macro_call(&self, span: Span, call: Box<ast::MacCall>) -> Box<ast::Expr> {
@@ -534,7 +526,7 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn pat(&self, span: Span, kind: PatKind) -> ast::Pat {
-        ast::Pat { id: ast::DUMMY_NODE_ID, kind, span, tokens: None }
+        ast::Pat { id: ast::DUMMY_NODE_ID, kind, span }
     }
     pub fn pat_wild(&self, span: Span) -> ast::Pat {
         self.pat(span, PatKind::Wild)
@@ -690,7 +682,6 @@ impl<'a> ExtCtxt<'a> {
             vis: ast::Visibility {
                 span: span.shrink_to_lo(),
                 kind: ast::VisibilityKind::Inherited,
-                tokens: None,
             },
             span,
             tokens: None,
@@ -716,6 +707,7 @@ impl<'a> ExtCtxt<'a> {
                     mutability,
                     expr: Some(expr),
                     define_opaque: None,
+                    eii_impls: Default::default(),
                 }
                 .into(),
             ),
@@ -729,7 +721,7 @@ impl<'a> ExtCtxt<'a> {
         ty: Box<ast::Ty>,
         rhs_kind: ast::ConstItemRhsKind,
     ) -> Box<ast::Item> {
-        let defaultness = ast::Defaultness::Final;
+        let defaultness = ast::Defaultness::Implicit;
         self.item(
             span,
             AttrVec::new(),

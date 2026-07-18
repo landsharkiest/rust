@@ -18,7 +18,11 @@ use stdx::JodChild;
 
 use crate::{
     ProcMacro, ProcMacroKind, ProtocolFormat, ServerError,
-    bidirectional_protocol::{self, SubCallback, msg::BidirectionalMessage, reject_subrequests},
+    bidirectional_protocol::{
+        self, SubCallback,
+        msg::{BidirectionalMessage, SubResponse},
+        reject_subrequests,
+    },
     legacy_protocol::{self, SpanMode},
     version,
 };
@@ -207,14 +211,18 @@ impl ProcMacroServerProcess {
     pub(crate) fn find_proc_macros(
         &self,
         dylib_path: &AbsPath,
-        callback: Option<SubCallback<'_>>,
     ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
         match self.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::find_proc_macros(self, dylib_path),
 
             Protocol::BidirectionalPostcardPrototype { .. } => {
-                let cb = callback.expect("callback required for bidirectional protocol");
-                bidirectional_protocol::find_proc_macros(self, dylib_path, cb)
+                bidirectional_protocol::find_proc_macros(self, dylib_path, &|_| {
+                    Ok(SubResponse::Cancel {
+                        reason: String::from(
+                            "Server should not do a sub request when loading proc-macros",
+                        ),
+                    })
+                })
             }
         }
     }
@@ -232,8 +240,9 @@ impl ProcMacroServerProcess {
     /// Enable support for rust-analyzer span mode if the server supports it.
     pub(crate) fn rust_analyzer_spans(&self) -> bool {
         match self.protocol {
-            Protocol::LegacyJson { mode } => mode == SpanMode::RustAnalyzer,
-            Protocol::BidirectionalPostcardPrototype { mode } => mode == SpanMode::RustAnalyzer,
+            Protocol::LegacyJson { mode } | Protocol::BidirectionalPostcardPrototype { mode } => {
+                mode == SpanMode::RustAnalyzer
+            }
         }
     }
 

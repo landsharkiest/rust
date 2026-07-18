@@ -7,20 +7,18 @@ use std::panic;
 use std::path::PathBuf;
 use std::thread::panicking;
 
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_error_messages::{DiagArgName, DiagArgValue, IntoDiagArg};
+use rustc_ast::attr::version::RustcVersion;
+use rustc_data_structures::sync::{DynSend, DynSync};
+use rustc_error_messages::{DiagArgMap, DiagArgName, DiagArgValue, IntoDiagArg};
 use rustc_lint_defs::{Applicability, LintExpectationId};
 use rustc_macros::{Decodable, Encodable};
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, Span, Spanned, Symbol};
 use tracing::debug;
 
 use crate::{
     CodeSuggestion, DiagCtxtHandle, DiagMessage, ErrCode, ErrorGuaranteed, ExplicitBug, Level,
     MultiSpan, StashKey, Style, Substitution, SubstitutionPart, SuggestionStyle, Suggestions,
 };
-
-pub type DiagArgMap = FxIndexMap<DiagArgName, DiagArgValue>;
 
 /// Trait for types that `Diag::emit` can return as a "guarantee" (or "proof")
 /// token that the emission happened.
@@ -108,6 +106,7 @@ impl EmissionGuarantee for rustc_span::fatal_error::FatalError {
 pub trait Diagnostic<'a, G: EmissionGuarantee = ErrorGuaranteed> {
     /// Write out as a diagnostic out of `DiagCtxt`.
     #[must_use]
+    #[track_caller]
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G>;
 }
 
@@ -121,37 +120,37 @@ where
     }
 }
 
+impl<'a> Diagnostic<'a, ()>
+    for Box<
+        dyn for<'b> FnOnce(DiagCtxtHandle<'b>, Level) -> Diag<'b, ()> + DynSync + DynSend + 'static,
+    >
+{
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        self(dcx, level)
+    }
+}
+
+/// Type used to emit diagnostic through a closure instead of implementing the `Diagnostic` trait.
+pub struct DiagDecorator<F: FnOnce(&mut Diag<'_, ()>)>(pub F);
+
+impl<'a, F: FnOnce(&mut Diag<'_, ()>)> Diagnostic<'a, ()> for DiagDecorator<F> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        let mut diag = Diag::new(dcx, level, "");
+        (self.0)(&mut diag);
+        diag
+    }
+}
+
 /// Trait implemented by error types. This should not be implemented manually. Instead, use
 /// `#[derive(Subdiagnostic)]` -- see [rustc_macros::Subdiagnostic].
 #[rustc_diagnostic_item = "Subdiagnostic"]
-pub trait Subdiagnostic
-where
-    Self: Sized,
-{
+pub trait Subdiagnostic {
     /// Add a subdiagnostic to an existing diagnostic.
     fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>);
 }
 
-/// Trait implemented by lint types. This should not be implemented manually. Instead, use
-/// `#[derive(LintDiagnostic)]` -- see [rustc_macros::LintDiagnostic].
-#[rustc_diagnostic_item = "LintDiagnostic"]
-pub trait LintDiagnostic<'a, G: EmissionGuarantee> {
-    /// Decorate a lint with the information from this type.
-    fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, G>);
-}
-
-pub trait LintDiagnosticBox<'a, G: EmissionGuarantee> {
-    fn decorate_lint_box<'b>(self: Box<Self>, diag: &'b mut Diag<'a, G>);
-}
-
-impl<'a, G: EmissionGuarantee, D: LintDiagnostic<'a, G>> LintDiagnosticBox<'a, G> for D {
-    fn decorate_lint_box<'b>(self: Box<Self>, diag: &'b mut Diag<'a, G>) {
-        self.decorate_lint(diag);
-    }
-}
-
 #[derive(Clone, Debug, Encodable, Decodable)]
-pub(crate) struct DiagLocation {
+pub struct DiagLocation {
     file: Cow<'static, str>,
     line: u32,
     col: u32,
@@ -159,7 +158,7 @@ pub(crate) struct DiagLocation {
 
 impl DiagLocation {
     #[track_caller]
-    fn caller() -> Self {
+    pub fn caller() -> Self {
         let loc = panic::Location::caller();
         DiagLocation { file: loc.file().into(), line: loc.line(), col: loc.column() }
     }
@@ -177,6 +176,8 @@ pub struct IsLint {
     pub(crate) name: String,
     /// Indicates whether this lint should show up in cargo's future breakage report.
     has_future_breakage: bool,
+    /// Indicates the minimum rust version this lint applies to
+    rust_version: Option<RustcVersion>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -247,9 +248,6 @@ pub struct DiagInner {
     pub suggestions: Suggestions,
     pub args: DiagArgMap,
 
-    // This is used to store args and restore them after a subdiagnostic is rendered.
-    pub reserved_args: DiagArgMap,
-
     /// This is not used for highlighting or rendering any error message. Rather, it can be used
     /// as a sort key to sort a buffer of diagnostics. By default, it is the primary span of
     /// `span` if there is one. Otherwise, it is `DUMMY_SP`.
@@ -260,7 +258,7 @@ pub struct DiagInner {
     pub long_ty_path: Option<PathBuf>,
     /// With `-Ztrack_diagnostics` enabled,
     /// we print where in rustc this error was emitted.
-    pub(crate) emitted_at: DiagLocation,
+    pub emitted_at: DiagLocation,
 }
 
 impl DiagInner {
@@ -280,7 +278,6 @@ impl DiagInner {
             children: vec![],
             suggestions: Suggestions::Enabled(vec![]),
             args: Default::default(),
-            reserved_args: Default::default(),
             sort_span: DUMMY_SP,
             is_lint: None,
             long_ty_path: None,
@@ -314,6 +311,11 @@ impl DiagInner {
         matches!(self.is_lint, Some(IsLint { has_future_breakage: true, .. }))
     }
 
+    /// Indicates the minimum rust version this lint applies to.
+    pub(crate) fn rust_version(&self) -> Option<RustcVersion> {
+        self.is_lint.as_ref().and_then(|is| is.rust_version)
+    }
+
     pub(crate) fn is_force_warn(&self) -> bool {
         match self.level {
             Level::ForceWarning => {
@@ -343,14 +345,6 @@ impl DiagInner {
 
     pub fn remove_arg(&mut self, name: &str) {
         self.args.swap_remove(name);
-    }
-
-    pub fn store_args(&mut self) {
-        self.reserved_args = self.args.clone();
-    }
-
-    pub fn restore_args(&mut self) {
-        self.args = std::mem::take(&mut self.reserved_args);
     }
 
     pub fn emitted_at_sub_diag(&self) -> Subdiag {
@@ -838,7 +832,7 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
     }
 
     with_fn! { with_multipart_suggestion,
-    /// Show a suggestion that has multiple parts to it.
+    /// Show a suggestion that has multiple parts to it, always as its own subdiagnostic.
     /// In other words, multiple changes need to be applied as part of this suggestion.
     pub fn multipart_suggestion(
         &mut self,
@@ -850,25 +844,9 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
             msg,
             suggestion,
             applicability,
-            SuggestionStyle::ShowCode,
-        )
-    } }
-
-    /// Show a suggestion that has multiple parts to it, always as its own subdiagnostic.
-    /// In other words, multiple changes need to be applied as part of this suggestion.
-    pub fn multipart_suggestion_verbose(
-        &mut self,
-        msg: impl Into<DiagMessage>,
-        suggestion: Vec<(Span, String)>,
-        applicability: Applicability,
-    ) -> &mut Self {
-        self.multipart_suggestion_with_style(
-            msg,
-            suggestion,
-            applicability,
             SuggestionStyle::ShowAlways,
         )
-    }
+    } }
 
     /// [`Diag::multipart_suggestion()`] but you can set the [`SuggestionStyle`].
     pub fn multipart_suggestion_with_style(
@@ -962,6 +940,7 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
         self
     } }
 
+    with_fn! { with_span_suggestion_with_style,
     /// [`Diag::span_suggestion()`] but you can set the [`SuggestionStyle`].
     pub fn span_suggestion_with_style(
         &mut self,
@@ -984,7 +963,7 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
             applicability,
         });
         self
-    }
+    } }
 
     with_fn! { with_span_suggestion_verbose,
     /// Always show the suggested change.
@@ -1020,7 +999,7 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
             msg,
             suggestions,
             applicability,
-            SuggestionStyle::ShowCode,
+            SuggestionStyle::ShowAlways,
         )
     } }
 
@@ -1163,22 +1142,12 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
     } }
 
     /// Add a subdiagnostic from a type that implements `Subdiagnostic` (see
-    /// [rustc_macros::Subdiagnostic]). Performs eager translation of any translatable messages
+    /// [rustc_macros::Subdiagnostic]). Performs eager formatting of any messages
     /// used in the subdiagnostic, so suitable for use with repeated messages (i.e. re-use of
     /// interpolated variables).
     pub fn subdiagnostic(&mut self, subdiagnostic: impl Subdiagnostic) -> &mut Self {
         subdiagnostic.add_to_diag(self);
         self
-    }
-
-    /// Fluent variables are not namespaced from each other, so when
-    /// `Diagnostic`s and `Subdiagnostic`s use the same variable name,
-    /// one value will clobber the other. Eagerly translating the
-    /// diagnostic uses the variables defined right then, before the
-    /// clobbering occurs.
-    pub fn eagerly_translate(&self, msg: impl Into<DiagMessage>) -> DiagMessage {
-        let args = self.args.iter();
-        self.dcx.eagerly_translate(msg.into(), args)
     }
 
     with_fn! { with_span,
@@ -1191,8 +1160,13 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
         self
     } }
 
-    pub fn is_lint(&mut self, name: String, has_future_breakage: bool) -> &mut Self {
-        self.is_lint = Some(IsLint { name, has_future_breakage });
+    pub fn is_lint(
+        &mut self,
+        name: String,
+        has_future_breakage: bool,
+        rust_version: Option<RustcVersion>,
+    ) -> &mut Self {
+        self.is_lint = Some(IsLint { name, has_future_breakage, rust_version });
         self
     }
 
@@ -1340,6 +1314,13 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
         drop(self);
     }
 
+    /// Cancels this diagnostic and returns its first message, if it exists.
+    pub fn cancel_into_message(self) -> Option<String> {
+        let s = self.diag.as_ref()?.messages.get(0)?.0.as_str().map(ToString::to_string);
+        self.cancel();
+        s
+    }
+
     /// See `DiagCtxt::stash_diagnostic` for details.
     pub fn stash(mut self, span: Span, key: StashKey) -> Option<ErrorGuaranteed> {
         let diag = self.take_diag();
@@ -1360,12 +1341,6 @@ impl<'a, G: EmissionGuarantee> Diag<'a, G> {
     pub fn delay_as_bug(mut self) -> G::EmitResult {
         self.downgrade_to_delayed_bug();
         self.emit()
-    }
-
-    pub fn remove_arg(&mut self, name: &str) {
-        if let Some(diag) = self.diag.as_mut() {
-            diag.remove_arg(name);
-        }
     }
 }
 

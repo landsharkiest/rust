@@ -2,13 +2,12 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use build_helper::ci::CiEnv;
-
 use super::{Builder, Kind};
 use crate::core::build_steps::test;
 use crate::core::build_steps::tool::SourceType;
-use crate::core::config::SplitDebuginfo;
 use crate::core::config::flags::Color;
+use crate::core::config::toml::pgo::PgoConfig;
+use crate::core::config::{CompressDebuginfo, SplitDebuginfo};
 use crate::utils::build_stamp;
 use crate::utils::helpers::{self, LldThreads, check_cfg_arg, linker_flags};
 use crate::{
@@ -16,8 +15,11 @@ use crate::{
     RemapScheme, TargetSelection, command, prepare_behaviour_dump_dir, t,
 };
 
-/// Represents flag values in `String` form with whitespace delimiter to pass it to the compiler
-/// later.
+/// Represents flag values in `String` form with a `\x1f` delimiter to pass to the compiler later.
+///
+/// Flags are emitted via `CARGO_ENCODED_RUSTFLAGS` / `CARGO_ENCODED_RUSTDOCFLAGS`,
+/// which use `\x1f` (ASCII Unit Separator) as the delimiter and therefore allow spaces
+/// within individual flag values (e.g. paths from `llvm-config --libdir`).
 ///
 /// `-Z crate-attr` flags will be applied recursively on the target code using the
 /// `rustc_parse::parser::Parser`. See `rustc_builtin_macros::cmdline_attrs::inject` for more
@@ -53,11 +55,16 @@ impl Rustflags {
     }
 
     fn arg(&mut self, arg: &str) -> &mut Self {
-        assert_eq!(arg.split(' ').count(), 1);
-        if !self.0.is_empty() {
-            self.0.push(' ');
+        assert!(
+            !arg.contains('\x1f'),
+            "rustflag must not contain the ASCII unit separator (\\x1f): {arg:?}"
+        );
+        if !arg.is_empty() {
+            if !self.0.is_empty() {
+                self.0.push('\x1f');
+            }
+            self.0.push_str(arg);
         }
-        self.0.push_str(arg);
         self
     }
 
@@ -69,6 +76,26 @@ impl Rustflags {
             self.env("RUSTFLAGS_BOOTSTRAP");
             self.arg("--cfg=bootstrap");
         }
+    }
+}
+
+/// Picks the environment variable and value to pass a set of [`Rustflags`] to cargo.
+///
+/// `flags` is the `\x1f`-separated string built by [`Rustflags`]. We prefer the plain,
+/// space-separated form (`RUSTFLAGS`/`RUSTDOCFLAGS`) so the command stays readable and
+/// copy-pasteable in bootstrap's debug output, and only fall back to the `CARGO_ENCODED_*` form
+/// (which keeps the `\x1f` separators) when a flag value contains a space that the plain,
+/// whitespace-split form can't represent. See <https://github.com/rust-lang/rust/issues/158749>.
+pub(super) fn flags_env(
+    plain: &'static str,
+    encoded: &'static str,
+    flags: &str,
+) -> (&'static str, String) {
+    // A space can only appear inside a flag value, since the separators are `\x1f`.
+    if flags.contains(' ') {
+        (encoded, flags.to_string())
+    } else {
+        (plain, flags.replace('\x1f', " "))
     }
 }
 
@@ -124,6 +151,9 @@ impl Cargo {
         cmd_kind: Kind,
     ) -> Cargo {
         let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind);
+        if target.synthetic {
+            cargo.arg("-Zjson-target-spec");
+        }
 
         match cmd_kind {
             // No need to configure the target linker for these command types.
@@ -167,7 +197,11 @@ impl Cargo {
         target: TargetSelection,
         cmd_kind: Kind,
     ) -> Cargo {
-        builder.cargo(compiler, mode, source_type, target, cmd_kind)
+        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind);
+        if target.synthetic {
+            cargo.arg("-Zjson-target-spec");
+        }
+        cargo
     }
 
     pub fn rustdocflag(&mut self, arg: &str) -> &mut Cargo {
@@ -335,9 +369,28 @@ impl Cargo {
             self.rustdocflags.arg(&arg);
         }
 
-        if !builder.config.dry_run() && builder.cc[&target].args().iter().any(|arg| arg == "-gz") {
-            self.rustflags.arg("-Clink-arg=-gz");
+        match builder.config.compress_debuginfo(target) {
+            CompressDebuginfo::Zlib => {
+                // Do not enable Zlib compression on:
+                // - Windows, because MSVC/PDB doesn't support it
+                // - macOS, because its linker doesn't know the flag
+                if !self.target.is_windows() && !self.target.is_apple() {
+                    // If we link through cc, we need the -Wl prefix.
+                    // If we don't, then we must not add it, because the linker wouldn't
+                    // understand it.
+                    if helpers::use_host_linker(target) {
+                        self.rustflags.arg("-Clink-arg=-Wl,--compress-debug-sections=zlib");
+                    } else {
+                        self.rustflags.arg("-Clink-arg=--compress-debug-sections=zlib");
+                    }
+                }
+            }
+            CompressDebuginfo::Off => {}
         }
+
+        // Ignore linker warnings for now. These are complicated to fix and don't affect the build.
+        // FIXME: we should really investigate these...
+        self.rustflags.arg("-Alinker-messages");
 
         // Throughout the build Cargo can execute a number of build scripts
         // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
@@ -448,14 +501,25 @@ impl From<Cargo> for BootstrapCommand {
 
         cargo.command.args(cargo.args);
 
-        let rustflags = &cargo.rustflags.0;
-        if !rustflags.is_empty() {
-            cargo.command.env("RUSTFLAGS", rustflags);
+        // Unset any inherited flag variables (plain and encoded) so cargo uses only the flags
+        // bootstrap sets below. Flags from the caller's environment have already been folded into
+        // the Rustflags struct via `propagate_cargo_env`. This also matters because we may set the
+        // plain form below, which cargo ignores when `CARGO_ENCODED_RUSTFLAGS` is also present.
+        cargo.command.env_remove("RUSTFLAGS");
+        cargo.command.env_remove("CARGO_ENCODED_RUSTFLAGS");
+        cargo.command.env_remove("RUSTDOCFLAGS");
+        cargo.command.env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
+
+        if !cargo.rustflags.0.is_empty() {
+            let (var, value) =
+                flags_env("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", &cargo.rustflags.0);
+            cargo.command.env(var, value);
         }
 
-        let rustdocflags = &cargo.rustdocflags.0;
-        if !rustdocflags.is_empty() {
-            cargo.command.env("RUSTDOCFLAGS", rustdocflags);
+        if !cargo.rustdocflags.0.is_empty() {
+            let (var, value) =
+                flags_env("RUSTDOCFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS", &cargo.rustdocflags.0);
+            cargo.command.env(var, value);
         }
 
         let encoded_hostflags = cargo.hostflags.encode();
@@ -504,17 +568,17 @@ impl Builder<'_> {
             }
         };
 
+        // Optionally suppress cargo output.
+        if self.config.quiet {
+            cargo.arg("--quiet");
+        }
+
         // Run cargo from the source root so it can find .cargo/config.
         // This matters when using vendoring and the working directory is outside the repository.
         cargo.current_dir(&self.src);
 
         let out_dir = self.stage_out(compiler, mode);
         cargo.env("CARGO_TARGET_DIR", &out_dir);
-
-        // Set this unconditionally. Cargo silently ignores `CARGO_BUILD_WARNINGS` when `-Z
-        // warnings` isn't present, which is hard to debug, and it's not worth the effort to keep
-        // them in sync.
-        cargo.arg("-Zwarnings");
 
         // Bootstrap makes a lot of assumptions about the artifacts produced in the target
         // directory. If users override the "build directory" using `build-dir`
@@ -551,9 +615,18 @@ impl Builder<'_> {
             assert_eq!(target, compiler.host);
         }
 
-        // Remove make-related flags to ensure Cargo can correctly set things up
-        cargo.env_remove("MAKEFLAGS");
-        cargo.env_remove("MFLAGS");
+        // Bootstrap only supports modern FIFO jobservers. Older pipe-based jobservers can run into
+        // "invalid file descriptor" errors, as the jobserver file descriptors are not inherited by
+        // scripts like bootstrap.py, while the environment variable is propagated. So, we pass
+        // MAKEFLAGS only if we detect a FIFO jobserver, otherwise we clear it.
+        let has_modern_jobserver = env::var("MAKEFLAGS")
+            .map(|flags| flags.contains("--jobserver-auth=fifo:"))
+            .unwrap_or(false);
+
+        if !has_modern_jobserver {
+            cargo.env_remove("MAKEFLAGS");
+            cargo.env_remove("MFLAGS");
+        }
 
         cargo
     }
@@ -576,6 +649,8 @@ impl Builder<'_> {
         let out_dir = self.stage_out(compiler, mode);
 
         let mut hostflags = HostFlags::default();
+
+        cargo.env("CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT", "true");
 
         // Codegen backends are not yet tracked by -Zbinary-dep-depinfo,
         // so we need to explicitly clear out if they've been updated.
@@ -668,16 +743,6 @@ impl Builder<'_> {
             rustflags.arg(sysroot_str);
         }
 
-        let use_new_symbol_mangling = self.config.rust_new_symbol_mangling.or_else(|| {
-            if mode != Mode::Std {
-                // The compiler and tools default to the new scheme
-                Some(true)
-            } else {
-                // std follows the flag's default, which per compiler-team#938 is v0 on nightly
-                None
-            }
-        });
-
         // By default, windows-rs depends on a native library that doesn't get copied into the
         // sysroot. Passing this cfg enables raw-dylib support instead, which makes the native
         // library unnecessary. This can be removed when windows-rs enables raw-dylib
@@ -687,7 +752,8 @@ impl Builder<'_> {
             rustflags.arg("--cfg=windows_raw_dylib");
         }
 
-        if let Some(usm) = use_new_symbol_mangling {
+        // When unset, follow the default of the compiler flag - the compiler, tools and std use v0
+        if let Some(usm) = self.config.rust_new_symbol_mangling {
             rustflags.arg(if usm {
                 "-Csymbol-mangling-version=v0"
             } else {
@@ -773,6 +839,10 @@ impl Builder<'_> {
                         .rustc_cmd(compiler)
                         .arg("--target")
                         .arg(target.rustc_target_arg())
+                        // FIXME(#152709): -Zunstable-options is to handle JSON targets.
+                        // Remove when JSON targets are stabilized.
+                        .arg("-Zunstable-options")
+                        .env("RUSTC_BOOTSTRAP", "1")
                         .arg("--print=file-names")
                         .arg("--crate-type=proc-macro")
                         .arg("-")
@@ -903,7 +973,10 @@ impl Builder<'_> {
         }
 
         let rustdoc_path = match cmd_kind {
-            Kind::Doc | Kind::Test | Kind::MiriTest => self.rustdoc_for_compiler(compiler),
+            Kind::Doc => self.rustdoc_for_compiler(compiler),
+            Kind::Test | Kind::MiriTest if self.test_target.runs_doctests() => {
+                self.rustdoc_for_compiler(compiler)
+            }
             _ => PathBuf::from("/path/to/nowhere/rustdoc/not/required"),
         };
 
@@ -1059,6 +1132,14 @@ impl Builder<'_> {
                         // rustc creates absolute paths (in part bc of the `rust-src` unremap
                         // and for working directory) so let's remap the build directory as well.
                         format!("{}={map_to}", self.build.src.display()),
+                        // remap OUT_DIR so they don't leak into artifacts.
+                        format!("{}={map_to}/out", self.build.out.display()),
+                        // on windows, rustc may use forward slashes internally
+                        #[cfg(windows)]
+                        format!(
+                            "{}={map_to}\\out",
+                            self.build.out.display().to_string().replace('/', "\\")
+                        ),
                     ]
                     .join("\t");
                     cargo.env("RUSTC_DEBUGINFO_MAP", map);
@@ -1079,6 +1160,14 @@ impl Builder<'_> {
                         // rustc creates absolute paths (in part bc of the `rust-src` unremap
                         // and for working directory) so let's remap the build directory as well.
                         format!("{}={map_to}", self.build.src.display()),
+                        // remap OUT_DIR so they don't leak into artifacts.
+                        format!("{}={map_to}/out", self.build.out.display()),
+                        // on windows, rustc may use forward slashes internally
+                        #[cfg(windows)]
+                        format!(
+                            "{}={map_to}\\out",
+                            self.build.out.display().to_string().replace('/', "\\")
+                        ),
                     ]
                     .join("\t");
                     cargo.env("RUSTC_DEBUGINFO_MAP", map);
@@ -1152,8 +1241,9 @@ impl Builder<'_> {
         if (mode == Mode::ToolRustcPrivate || mode == Mode::Codegen)
             && let Some(llvm_config) = self.llvm_config(target)
         {
-            let llvm_libdir =
+            let llvm_libdir_raw =
                 command(llvm_config).cached().arg("--libdir").run_capture_stdout(self).stdout();
+            let llvm_libdir = llvm_libdir_raw.trim();
             if target.is_msvc() {
                 rustflags.arg(&format!("-Clink-arg=-LIBPATH:{llvm_libdir}"));
             } else {
@@ -1326,7 +1416,7 @@ impl Builder<'_> {
         // Try to use a sysroot-relative bindir, in case it was configured absolutely.
         cargo.env("RUSTC_INSTALL_BINDIR", self.config.bindir_relative());
 
-        if CiEnv::is_ci() {
+        if self.config.is_running_on_ci() {
             // Tell cargo to use colored output for nicer logs in CI, even
             // though CI isn't printing to a terminal.
             // Also set an explicit `TERM=xterm` so that cargo doesn't warn
@@ -1437,4 +1527,45 @@ pub fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> String {
         (_, false) => "DEV",
     };
     format!("CARGO_PROFILE_{profile}_{name}")
+}
+
+/// Applies PGO compile flags to the given Cargo invocation based on the given PGO config.
+/// PGO flags are only applied when compiling a stage2 component.
+pub fn apply_pgo(
+    builder: &Builder<'_>,
+    cargo: &mut Cargo,
+    build_compiler: Compiler,
+    config: &PgoConfig,
+) {
+    let is_collecting = if let Some(path) = &config.generate_profile {
+        if build_compiler.stage == 1 {
+            cargo
+                .rustflag(&format!("-Cprofile-generate={}", path.to_str().expect("non-UTF8 path")));
+            // Apparently necessary to avoid overflowing the counters during
+            // a Cargo build profile
+            cargo.rustflag("-Cllvm-args=-vp-counters-per-site=4");
+            true
+        } else {
+            false
+        }
+    } else if let Some(path) = &config.use_profile {
+        if build_compiler.stage == 1 {
+            cargo.rustflag(&format!("-Cprofile-use={}", path.to_str().expect("non-UTF8 path")));
+            if builder.is_verbose() {
+                cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if is_collecting {
+        // Ensure paths to Rust sources are relative, not absolute.
+        cargo.rustflag(&format!(
+            "-Cllvm-args=-static-func-strip-dirname-prefix={}",
+            builder.config.src.components().count()
+        ));
+    }
 }

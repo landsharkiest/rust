@@ -91,6 +91,14 @@ struct G {
 }
 
 #[derive(Subdiagnostic)]
+#[label("...")]
+struct H {
+    #[primary_span]
+    span: Span,
+    var: String,
+}
+
+#[derive(Subdiagnostic)]
 #[label(slug = 4)]
 //~^ ERROR no nested attribute expected here
 //~| ERROR diagnostic message must be first argument
@@ -282,7 +290,6 @@ struct AA {
 struct AB {
     #[primary_span]
     span: Span,
-    #[skip_arg]
     z: Z,
 }
 

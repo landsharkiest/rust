@@ -15,9 +15,10 @@ use rustc_session::config::{
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::{EarlyDiagCtxt, getopts};
-use rustc_span::FileName;
 use rustc_span::edition::Edition;
+use rustc_span::{FileName, RemapPathScopeComponents};
 use rustc_target::spec::TargetTuple;
+use smallvec::SmallVec;
 
 use crate::core::new_dcx;
 use crate::externalfiles::ExternalHtml;
@@ -28,31 +29,16 @@ use crate::passes::{self, Condition};
 use crate::scrape_examples::{AllCallLocations, ScrapeExamplesOptions};
 use crate::{html, opts, theme};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OutputFormat {
-    Json,
-    #[default]
+    /// `--output-format=json` without `--show-coverage`.
+    ///
+    /// JSON description of crate API.
+    IrJson,
+    /// `--output-format=json` with `--show-coverage`.
+    CoverageJson,
     Html,
     Doctest,
-}
-
-impl OutputFormat {
-    pub(crate) fn is_json(&self) -> bool {
-        matches!(self, OutputFormat::Json)
-    }
-}
-
-impl TryFrom<&str> for OutputFormat {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "json" => Ok(OutputFormat::Json),
-            "html" => Ok(OutputFormat::Html),
-            "doctest" => Ok(OutputFormat::Doctest),
-            _ => Err(format!("unknown output format `{value}`")),
-        }
-    }
 }
 
 /// Either an input crate, markdown file, or nothing (--merge=finalize).
@@ -140,6 +126,8 @@ pub(crate) struct Options {
     pub(crate) no_run: bool,
     /// What sources are being mapped.
     pub(crate) remap_path_prefix: Vec<(PathBuf, PathBuf)>,
+    /// Which scope(s) to use with `--remap-path-prefix`
+    pub(crate) remap_path_scope: RemapPathScopeComponents,
 
     /// The path to a rustc-like binary to build tests with. If not set, we
     /// default to loading from `$sysroot/bin/rustc`.
@@ -222,6 +210,7 @@ impl fmt::Debug for Options {
             .field("no_run", &self.no_run)
             .field("test_builder_wrappers", &self.test_builder_wrappers)
             .field("remap-file-prefix", &self.remap_path_prefix)
+            .field("remap-file-scope", &self.remap_path_scope)
             .field("no_capture", &self.no_capture)
             .field("scrape_examples_options", &self.scrape_examples_options)
             .field("unstable_features", &self.unstable_features)
@@ -290,7 +279,7 @@ pub(crate) struct RenderOptions {
     /// Note: this field is duplicated in `Options` because it's useful to have
     /// it in both places.
     pub(crate) unstable_features: rustc_feature::UnstableFeatures,
-    pub(crate) emit: Vec<EmitType>,
+    pub(crate) emit: SmallVec<[EmitType; 2]>,
     /// If `true`, HTML source pages will generate links for items to their definition.
     pub(crate) generate_link_to_definition: bool,
     /// Set of function-call locations to include as examples
@@ -322,9 +311,24 @@ pub(crate) enum ModuleSorting {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EmitType {
-    Toolchain,
-    InvocationSpecific,
+    HtmlStaticFiles,
+    HtmlNonStaticFiles,
+    // not explicitly nameable by the user for now
+    IrJsonFiles,
+    CoverageJsonFiles,
     DepInfo(Option<OutFileName>),
+}
+
+impl fmt::Display for EmitType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HtmlStaticFiles => "html-static-files",
+            Self::HtmlNonStaticFiles => "html-non-static-files",
+            Self::IrJsonFiles => "ir-json-files",
+            Self::CoverageJsonFiles => "coverage-json-files",
+            Self::DepInfo(_) => "dep-info",
+        })
+    }
 }
 
 impl FromStr for EmitType {
@@ -332,8 +336,9 @@ impl FromStr for EmitType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "toolchain-shared-resources" => Ok(Self::Toolchain),
-            "invocation-specific" => Ok(Self::InvocationSpecific),
+            // modern choices
+            "html-static-files" => Ok(Self::HtmlStaticFiles),
+            "html-non-static-files" => Ok(Self::HtmlNonStaticFiles),
             "dep-info" => Ok(Self::DepInfo(None)),
             option => match option.strip_prefix("dep-info=") {
                 Some("-") => Ok(Self::DepInfo(Some(OutFileName::Stdout))),
@@ -345,17 +350,11 @@ impl FromStr for EmitType {
 }
 
 impl RenderOptions {
-    pub(crate) fn should_emit_crate(&self) -> bool {
-        self.emit.is_empty() || self.emit.contains(&EmitType::InvocationSpecific)
-    }
-
     pub(crate) fn dep_info(&self) -> Option<Option<&OutFileName>> {
-        for emit in &self.emit {
-            if let EmitType::DepInfo(file) = emit {
-                return Some(file.as_ref());
-            }
-        }
-        None
+        self.emit.iter().find_map(|emit| match emit {
+            EmitType::DepInfo(file) => Some(file.as_ref()),
+            _ => None,
+        })
     }
 }
 
@@ -409,9 +408,9 @@ impl Options {
             config::parse_error_format(early_dcx, matches, color, json_color, json_rendered);
         let diagnostic_width = matches.opt_get("diagnostic-width").unwrap_or_default();
 
-        let mut target_modifiers = BTreeMap::<OptionsTargetModifiers, String>::new();
-        let codegen_options = CodegenOptions::build(early_dcx, matches, &mut target_modifiers);
-        let unstable_opts = UnstableOptions::build(early_dcx, matches, &mut target_modifiers);
+        let mut collected_options = Default::default();
+        let codegen_options = CodegenOptions::build(early_dcx, matches, &mut collected_options);
+        let unstable_opts = UnstableOptions::build(early_dcx, matches, &mut collected_options);
 
         let remap_path_prefix = match parse_remap_path_prefix(matches) {
             Ok(prefix_mappings) => prefix_mappings,
@@ -419,6 +418,8 @@ impl Options {
                 early_dcx.early_fatal(err);
             }
         };
+        let remap_path_scope =
+            rustc_session::config::parse_remap_path_scope(early_dcx, matches, &unstable_opts);
 
         let dcx = new_dcx(error_format, None, diagnostic_width, &unstable_opts);
         let dcx = dcx.handle();
@@ -458,58 +459,104 @@ impl Options {
             return None;
         }
 
-        let mut emit = FxIndexMap::<_, EmitType>::default();
-        for list in matches.opt_strs("emit") {
-            for kind in list.split(',') {
-                match kind.parse() {
-                    Ok(kind) => {
-                        // De-duplicate emit types and the last wins.
-                        // Only one instance for each type is allowed
-                        // regardless the actual data it carries.
-                        // This matches rustc's `--emit` behavior.
-                        emit.insert(std::mem::discriminant(&kind), kind);
-                    }
-                    Err(()) => dcx.fatal(format!("unrecognized emission type: {kind}")),
-                }
-            }
-        }
-        let emit = emit.into_values().collect::<Vec<_>>();
+        let should_test = matches.opt_present("test");
 
         let show_coverage = matches.opt_present("show-coverage");
         let output_format_s = matches.opt_str("output-format");
-        let output_format = match output_format_s {
-            Some(ref s) => match OutputFormat::try_from(s.as_str()) {
-                Ok(out_fmt) => out_fmt,
-                Err(e) => dcx.fatal(e),
-            },
-            None => OutputFormat::default(),
+        let output_format = match output_format_s.as_deref() {
+            None | Some("html") => OutputFormat::Html,
+            Some("json") => {
+                if show_coverage {
+                    OutputFormat::CoverageJson
+                } else {
+                    OutputFormat::IrJson
+                }
+            }
+            Some("doctest") => OutputFormat::Doctest,
+            Some(other) => dcx.fatal(format!("unknown output format `{other}`")),
         };
 
-        // check for `--output-format=json`
+        // check for `--output-format` stability, and compatibility with `--show-coverage`
         match (
             output_format_s.as_ref().map(|_| output_format),
             show_coverage,
             nightly_options::is_unstable_enabled(matches),
         ) {
-            (None | Some(OutputFormat::Json), true, _) => {}
+            (None | Some(OutputFormat::CoverageJson), true, _) => {}
             (_, true, _) => {
                 dcx.fatal(format!(
                     "`--output-format={}` is not supported for the `--show-coverage` option",
-                    output_format_s.unwrap_or_default(),
+                    output_format_s.expect("checked for none above"),
                 ));
             }
             // If `-Zunstable-options` is used, nothing to check after this point.
             (_, false, true) => {}
             (None | Some(OutputFormat::Html), false, _) => {}
-            (Some(OutputFormat::Json), false, false) => {
+            (Some(OutputFormat::IrJson), false, false) => {
                 dcx.fatal(
-                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see https://github.com/rust-lang/rust/issues/76578)",
+                    "the -Z unstable-options flag must be passed to enable --output-format=json for documentation generation (see https://github.com/rust-lang/rust/issues/76578)",
                 );
             }
             (Some(OutputFormat::Doctest), false, false) => {
                 dcx.fatal(
-                    "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see https://github.com/rust-lang/rust/issues/134529)",
+                    "the -Z unstable-options flag must be passed to enable --output-format=doctest (see https://github.com/rust-lang/rust/issues/134529)",
                 );
+            }
+            (Some(OutputFormat::CoverageJson), false, _) => {
+                unreachable!("CoverageJson is only possible when show_coverage is true")
+            }
+        }
+
+        let mut emit = FxIndexMap::default();
+        for list in matches.opt_strs("emit") {
+            if should_test {
+                dcx.fatal("the `--test` flag and the `--emit` flag are not supported together");
+            }
+            if let OutputFormat::Doctest = output_format {
+                dcx.fatal("the `--emit` flag is not supported with `--output-format=doctest`");
+            }
+
+            for typ in list.split(',') {
+                let Ok(typ) = typ.parse::<EmitType>() else {
+                    dcx.fatal(format!("unrecognized emission type: {typ}"))
+                };
+
+                match typ {
+                    EmitType::DepInfo(_) => match output_format {
+                        OutputFormat::Html | OutputFormat::IrJson | OutputFormat::CoverageJson => {}
+                        OutputFormat::Doctest => unreachable!(),
+                    },
+                    EmitType::HtmlStaticFiles | EmitType::HtmlNonStaticFiles => match output_format
+                    {
+                        OutputFormat::Html => {}
+                        OutputFormat::IrJson | OutputFormat::CoverageJson => dcx.fatal(format!(
+                            "the `--emit={typ}` flag is not supported with `--output-format=json`",
+                        )),
+                        OutputFormat::Doctest => unreachable!(),
+                    },
+                    EmitType::IrJsonFiles | EmitType::CoverageJsonFiles => unreachable!(),
+                }
+
+                // De-duplicate emit types and the last wins.
+                // Only one instance for each type is allowed
+                // regardless the actual data it carries.
+                // This matches rustc's `--emit` behavior.
+                emit.insert(std::mem::discriminant(&typ), typ);
+            }
+        }
+        let mut emit: SmallVec<[_; 2]> = emit.into_values().collect();
+        // If `--emit` is absent we'll register default emission types depending on the requested
+        // output format. We can safely use `is_empty` for this since `--emit=` ("truly empty")
+        // will have already been rejected above.
+        if emit.is_empty() {
+            match output_format {
+                OutputFormat::IrJson => emit.push(EmitType::IrJsonFiles),
+                OutputFormat::CoverageJson => emit.push(EmitType::CoverageJsonFiles),
+                OutputFormat::Html => {
+                    emit.push(EmitType::HtmlStaticFiles);
+                    emit.push(EmitType::HtmlNonStaticFiles);
+                }
+                OutputFormat::Doctest => {}
             }
         }
 
@@ -551,33 +598,65 @@ impl Options {
 
         let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(early_dcx, matches);
 
-        let input = if describe_lints {
-            InputMode::HasFile(make_input(early_dcx, ""))
-        } else {
-            match matches.free.as_slice() {
-                [] if matches.opt_str("merge").as_deref() == Some("finalize") => {
-                    InputMode::NoInputMergeFinalize
-                }
-                [] => dcx.fatal("missing file operand"),
-                [input] => InputMode::HasFile(make_input(early_dcx, input)),
-                _ => dcx.fatal("too many file operands"),
-            }
-        };
-
         let externs = parse_externs(early_dcx, matches, &unstable_opts);
         let extern_html_root_urls = match parse_extern_html_roots(matches) {
             Ok(ex) => ex,
             Err(err) => dcx.fatal(err),
         };
 
-        let parts_out_dir =
-            match matches.opt_str("parts-out-dir").map(PathToParts::from_flag).transpose() {
+        let mut parts_out_dir =
+            match matches.opt_str("write-doc-meta-dir").map(PathToParts::from_flag).transpose() {
                 Ok(parts_out_dir) => parts_out_dir,
                 Err(e) => dcx.fatal(e),
             };
-        let include_parts_dir = match parse_include_parts_dir(matches) {
+        let mut include_parts_dir = match parse_read_doc_meta(matches, "read-doc-meta-dir") {
             Ok(include_parts_dir) => include_parts_dir,
             Err(e) => dcx.fatal(e),
+        };
+        let mut should_merge = compute_should_merge(matches);
+        if parts_out_dir.is_none() && include_parts_dir.is_empty() {
+            // we'll need to get rid of this stuff once Cargo stops using them
+            parts_out_dir =
+                match matches.opt_str("parts-out-dir").map(PathToParts::from_flag).transpose() {
+                    Ok(parts_out_dir) => parts_out_dir,
+                    Err(e) => dcx.fatal(e),
+                };
+            include_parts_dir = match parse_read_doc_meta(matches, "include-parts-dir") {
+                Ok(include_parts_dir) => include_parts_dir,
+                Err(e) => dcx.fatal(e),
+            };
+            should_merge = match matches.opt_str("merge").as_deref() {
+                None => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+                Some("none") => ShouldMerge { read_rendered_cci: false, write_rendered_cci: false },
+                Some("shared") => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+                Some("finalize") => {
+                    ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }
+                }
+                Some(_) => dcx.fatal("argument to --merge must be `none`, `shared`, or `finalize`"),
+            };
+        } else if matches.opt_str("parts-out-dir").is_some() {
+            dcx.fatal(
+                "deprecated version of write-doc-meta-dir is used with new doc-meta-dir stuff",
+            );
+        } else if matches.opt_str("include-parts-dir").is_some() {
+            dcx.fatal(
+                "deprecated version of read-doc-meta-dir is used with new doc-meta-dir stuff",
+            );
+        } else if matches.opt_str("merge").is_some() {
+            dcx.fatal("deprecated parameter merge is used with new doc-meta-dir stuff");
+        }
+
+        let input = if describe_lints {
+            InputMode::HasFile(make_input(early_dcx, ""))
+        } else {
+            match matches.free.as_slice() {
+                [] if !include_parts_dir.is_empty() && should_merge.write_rendered_cci => {
+                    InputMode::NoInputMergeFinalize
+                }
+                [] => dcx.fatal("missing file operand"),
+                [input] => InputMode::HasFile(make_input(early_dcx, input)),
+                _ => dcx.fatal("too many file operands"),
+            }
         };
 
         let default_settings: Vec<Vec<(String, String)>> = vec![
@@ -630,7 +709,6 @@ impl Options {
         let test_args: Vec<String> =
             test_args.iter().flat_map(|s| s.split_whitespace()).map(|s| s.to_string()).collect();
 
-        let should_test = matches.opt_present("test");
         let no_run = matches.opt_present("no-run");
 
         if !should_test && no_run {
@@ -736,10 +814,12 @@ impl Options {
         }
 
         let index_page = matches.opt_str("index-page").map(|s| PathBuf::from(&s));
-        if let Some(ref index_page) = index_page
-            && !index_page.is_file()
-        {
-            dcx.fatal("option `--index-page` argument must be a file");
+        if let Some(ref index_page) = index_page {
+            if index_page.is_file() {
+                loaded_paths.push(index_page.clone());
+            } else {
+                dcx.fatal("option `--index-page` argument must be a file");
+            }
         }
 
         let target = parse_target_triple(early_dcx, matches);
@@ -802,10 +882,6 @@ impl Options {
         let extern_html_root_takes_precedence =
             matches.opt_present("extern-html-root-takes-precedence");
         let html_no_source = matches.opt_present("html-no-source");
-        let should_merge = match parse_merge(matches) {
-            Ok(result) => result,
-            Err(e) => dcx.fatal(format!("--merge option error: {e}")),
-        };
         let merge_doctests = parse_merge_doctests(matches, edition, dcx);
         tracing::debug!("merge_doctests: {merge_doctests:?}");
 
@@ -867,6 +943,7 @@ impl Options {
             no_run,
             test_builder_wrappers,
             remap_path_prefix,
+            remap_path_scope,
             no_capture,
             crate_name,
             output_format,
@@ -874,7 +951,7 @@ impl Options {
             scrape_examples_options,
             unstable_features,
             doctest_build_args,
-            target_modifiers,
+            target_modifiers: collected_options.target_modifiers,
         };
         let render_options = RenderOptions {
             output,
@@ -999,7 +1076,7 @@ impl PathToParts {
         // check here is for diagnostics
         if path.exists() && !path.is_dir() {
             Err(format!(
-                "--parts-out-dir and --include-parts-dir expect directories, found: {}",
+                "--write-doc-meta-dir and --read-doc-meta-dir expect directories, found: {}",
                 path.display(),
             ))
         } else {
@@ -1009,15 +1086,15 @@ impl PathToParts {
     }
 }
 
-/// Reports error if --include-parts-dir is not a directory
-fn parse_include_parts_dir(m: &getopts::Matches) -> Result<Vec<PathToParts>, String> {
+/// Reports error if --read-doc-meta-dir is not a directory
+fn parse_read_doc_meta(m: &getopts::Matches, name: &str) -> Result<Vec<PathToParts>, String> {
     let mut ret = Vec::new();
-    for p in m.opt_strs("include-parts-dir") {
+    for p in m.opt_strs(name) {
         let p = PathToParts::from_flag(p)?;
         // this is just for diagnostic
         if !p.0.is_dir() {
             return Err(format!(
-                "--include-parts-dir expected {} to be a directory",
+                "--read-doc-meta-dir expected {} to be a directory",
                 p.0.display()
             ));
         }
@@ -1037,23 +1114,15 @@ pub(crate) struct ShouldMerge {
 
 /// Extracts read_rendered_cci and write_rendered_cci from command line arguments, or
 /// reports an error if an invalid option was provided
-fn parse_merge(m: &getopts::Matches) -> Result<ShouldMerge, &'static str> {
-    match m.opt_str("merge").as_deref() {
-        // default = read-write
-        None => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
-        Some("none") if m.opt_present("include-parts-dir") => {
-            Err("--include-parts-dir not allowed if --merge=none")
-        }
-        Some("none") => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: false }),
-        Some("shared") if m.opt_present("parts-out-dir") || m.opt_present("include-parts-dir") => {
-            Err("--parts-out-dir and --include-parts-dir not allowed if --merge=shared")
-        }
-        Some("shared") => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
-        Some("finalize") if m.opt_present("parts-out-dir") => {
-            Err("--parts-out-dir not allowed if --merge=finalize")
-        }
-        Some("finalize") => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }),
-        Some(_) => Err("argument to --merge must be `none`, `shared`, or `finalize`"),
+fn compute_should_merge(m: &getopts::Matches) -> ShouldMerge {
+    match (m.opt_present("read-doc-meta-dir"), m.opt_present("write-doc-meta-dir")) {
+        // shared mode
+        (false, false) => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+        // intermediate mode
+        (false, true) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: false },
+        // finalize mode
+        (true, false) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: true },
+        (true, true) => ShouldMerge { read_rendered_cci: false, write_rendered_cci: true },
     }
 }
 

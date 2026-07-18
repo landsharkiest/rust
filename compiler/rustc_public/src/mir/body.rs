@@ -139,7 +139,7 @@ pub struct BasicBlock {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Terminator {
     pub kind: TerminatorKind,
-    pub span: Span,
+    pub source_info: SourceInfo,
 }
 
 impl Terminator {
@@ -269,6 +269,7 @@ pub enum AssertMessage {
     ResumedAfterDrop(CoroutineKind),
     MisalignedPointerDereference { required: Operand, found: Operand },
     NullPointerDereference,
+    NullReferenceConstructed,
     InvalidEnumConstruction(Operand),
 }
 
@@ -342,6 +343,7 @@ impl AssertMessage {
                 Ok("misaligned pointer dereference")
             }
             AssertMessage::NullPointerDereference => Ok("null pointer dereference occurred"),
+            AssertMessage::NullReferenceConstructed => Ok("null reference produced"),
             AssertMessage::InvalidEnumConstruction(_) => {
                 Ok("trying to construct an enum from an invalid value")
             }
@@ -439,11 +441,9 @@ pub enum FakeReadCause {
 
 /// Describes what kind of retag is to be performed
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-pub enum RetagKind {
-    FnEntry,
-    TwoPhase,
-    Raw,
-    Default,
+pub enum WithRetag {
+    Yes,
+    No,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize)]
@@ -470,7 +470,7 @@ pub enum NonDivergingIntrinsic {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Statement {
     pub kind: StatementKind,
-    pub span: Span,
+    pub source_info: SourceInfo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -480,7 +480,6 @@ pub enum StatementKind {
     SetDiscriminant { place: Place, variant_index: VariantIdx },
     StorageLive(Local),
     StorageDead(Local),
-    Retag(RetagKind, Place),
     PlaceMention(Place),
     AscribeUserType { place: Place, projections: UserTypeProjection, variance: Variance },
     Coverage(Coverage),
@@ -567,13 +566,6 @@ pub enum Rvalue {
     /// [#74836]: https://github.com/rust-lang/rust/issues/74836
     Repeat(Operand, TyConst),
 
-    /// Transmutes a `*mut u8` into shallow-initialized `Box<T>`.
-    ///
-    /// This is different from a normal transmute because dataflow analysis will treat the box as
-    /// initialized but its content as uninitialized. Like other pointer casts, this in general
-    /// affects alias analysis.
-    ShallowInitBox(Operand, Ty),
-
     /// Creates a pointer/reference to the given thread local.
     ///
     /// The yielded type is a `*mut T` if the static is mutable, otherwise if the static is extern a
@@ -594,14 +586,21 @@ pub enum Rvalue {
     /// return a value with the same type as their operand.
     UnaryOp(UnOp, Operand),
 
-    /// Yields the operand unchanged
-    Use(Operand),
+    /// Yields the operand unchanged, except for possibly a retag.
+    Use(Operand, WithRetag),
+
+    /// Creates a bitwise copy of the source type, producing either a value of the same type (when
+    /// Mutability::Mut) or a different type with a guaranteed equal memory layout defined by the
+    /// CoerceShared trait. See [`Rvalue::Reborrow`] for a more detailed explanation.
+    ///
+    /// [`Rvalue::Reborrow`]: rustc_middle::mir::Rvalue::Reborrow
+    Reborrow(Ty, Mutability, Place),
 }
 
 impl Rvalue {
     pub fn ty(&self, locals: &[LocalDecl]) -> Result<Ty, Error> {
         match self {
-            Rvalue::Use(operand) => operand.ty(locals),
+            Rvalue::Use(operand, _) => operand.ty(locals),
             Rvalue::Repeat(operand, count) => {
                 Ok(Ty::new_array_with_const_len(operand.ty(locals)?, count.clone()))
             }
@@ -610,6 +609,7 @@ impl Rvalue {
                 let place_ty = place.ty(locals)?;
                 Ok(Ty::new_ref(reg.clone(), place_ty, bk.to_mutable_lossy()))
             }
+            Rvalue::Reborrow(target, _, _) => Ok(*target),
             Rvalue::AddressOf(mutability, place) => {
                 let place_ty = place.ty(locals)?;
                 Ok(Ty::new_ptr(place_ty, mutability.to_mutable_lossy()))
@@ -651,7 +651,6 @@ impl Rvalue {
                 }
                 AggregateKind::RawPtr(ty, mutability) => Ok(Ty::new_ptr(ty, mutability)),
             },
-            Rvalue::ShallowInitBox(_, ty) => Ok(Ty::new_box(*ty)),
             Rvalue::CopyForDeref(place) => place.ty(locals),
         }
     }

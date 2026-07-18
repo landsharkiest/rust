@@ -7,10 +7,11 @@ use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AstIdLoc, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId,
     Lookup, MacroId, ModuleDefId, ModuleId, TraitId,
-    db::DefDatabase,
+    expr_store::Body,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
     nameres::crate_def_map,
     per_ns::Item,
+    signatures::{EnumSignature, ImplSignature, TraitSignature},
     src::{HasChildSource, HasSource},
     visibility::{Visibility, VisibilityExplicitness},
 };
@@ -185,11 +186,11 @@ impl<'a> SymbolCollector<'a> {
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(id)) => {
                     this.push_decl(id, name, false, None);
-                    let enum_name = Symbol::intern(this.db.enum_signature(id).name.as_str());
+                    let enum_name = Symbol::intern(EnumSignature::of(this.db, id).name.as_str());
                     this.with_container_name(Some(enum_name), |this| {
                         let variants = id.enum_variants(this.db);
-                        for (variant_id, variant_name, _) in &variants.variants {
-                            this.push_decl(*variant_id, variant_name, true, None);
+                        for (variant_name, (variant_id, _)) in &variants.variants {
+                            this.push_decl(*variant_id, variant_name, false, None);
                         }
                     });
                 }
@@ -386,7 +387,7 @@ impl<'a> SymbolCollector<'a> {
             return;
         }
         let body_id = body_id.into();
-        let body = self.db.body(body_id);
+        let body = Body::of(self.db, body_id);
 
         // Descend into the blocks and enqueue collection of all modules within.
         for (_, def_map) in body.blocks(self.db) {
@@ -397,9 +398,9 @@ impl<'a> SymbolCollector<'a> {
     }
 
     fn collect_from_impl(&mut self, impl_id: ImplId) {
-        let impl_data = self.db.impl_signature(impl_id);
+        let impl_data = ImplSignature::of(self.db, impl_id);
         let impl_name = Some(
-            hir_display_with_store(impl_data.self_ty, &impl_data.store)
+            hir_display_with_store(impl_data.self_ty, impl_id.into(), &impl_data.store)
                 .display(
                     self.db,
                     crate::Impl::from(impl_id).krate(self.db).to_display_target(self.db),
@@ -408,7 +409,7 @@ impl<'a> SymbolCollector<'a> {
         );
         self.with_container_name(impl_name.as_deref().map(Symbol::intern), |s| {
             for &(ref name, assoc_item_id) in &impl_id.impl_items(self.db).items {
-                if s.collect_pub_only && s.db.assoc_visibility(assoc_item_id) != Visibility::Public
+                if s.collect_pub_only && assoc_item_id.assoc_visibility(s.db) != Visibility::Public
                 {
                     continue;
                 }
@@ -419,7 +420,7 @@ impl<'a> SymbolCollector<'a> {
     }
 
     fn collect_from_trait(&mut self, trait_id: TraitId, trait_do_not_complete: Complete) {
-        let trait_data = self.db.trait_signature(trait_id);
+        let trait_data = TraitSignature::of(self.db, trait_id);
         self.with_container_name(Some(Symbol::intern(trait_data.name.as_str())), |s| {
             for &(ref name, assoc_item_id) in &trait_id.trait_items(self.db).items {
                 s.push_assoc_item(assoc_item_id, name, Some(trait_do_not_complete));
@@ -458,7 +459,7 @@ impl<'a> SymbolCollector<'a> {
         trait_do_not_complete: Option<Complete>,
     ) -> Complete
     where
-        L: Lookup<Database = dyn DefDatabase> + Into<ModuleDefId>,
+        L: Lookup + Into<ModuleDefId>,
         <L as Lookup>::Data: HasSource,
         <<L as Lookup>::Data as HasSource>::Value: HasName,
     {

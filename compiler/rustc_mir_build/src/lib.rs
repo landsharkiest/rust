@@ -1,9 +1,7 @@
 //! Construction of MIR from HIR.
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(assert_matches))]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
 
@@ -13,7 +11,7 @@
 mod builder;
 mod check_tail_calls;
 mod check_unsafety;
-mod errors;
+mod diagnostics;
 pub mod thir;
 
 use rustc_middle::util::Providers;

@@ -1,9 +1,8 @@
-use rustc_abi::CanonAbi;
-use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::callconv::FnAbi;
 
-use super::{packssdw, packsswb, packusdw, packuswb, permute, pmaddbw, pmaddwd, psadbw, pshufb};
+use super::{
+    packssdw, packsswb, packusdw, packuswb, permute, permute2, pmaddbw, pmaddwd, psadbw, pshufb,
+};
 use crate::*;
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -11,10 +10,9 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_avx512_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
-    ) -> InterpResult<'tcx, EmulateItemResult> {
+    ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         // Prefix should have already been checked.
         let unprefixed_name = link_name.as_str().strip_prefix("llvm.x86.avx512.").unwrap();
@@ -27,8 +25,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.expect_target_feature_for_intrinsic(link_name, "avx512vl")?;
                 }
 
-                let [a, b, c, imm8] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [a, b, c, imm8] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 assert_eq!(dest.layout, a.layout);
                 assert_eq!(dest.layout, b.layout);
@@ -83,8 +80,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "psad.bw.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [left, right] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 psadbw(this, left, right, dest)?
             }
@@ -92,29 +88,49 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "pmaddw.d.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [left, right] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 pmaddwd(this, left, right, dest)?;
             }
             // Used to implement the _mm512_maddubs_epi16 function.
             "pmaddubs.w.512" => {
-                let [left, right] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 pmaddbw(this, left, right, dest)?;
             }
-            // Used to implement the _mm512_permutexvar_epi32 function.
-            "permvar.si.512" => {
-                let [left, right] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+            // Used to implement the _mm512_permutexvar_epi32/_mm512_permutexvar_epi64 functions.
+            "permvar.si.512" | "permvar.di.512" => {
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 permute(this, left, right, dest)?;
             }
+            "permvar.qi.512" | "permvar.qi.256" | "permvar.qi.128" => {
+                this.expect_target_feature_for_intrinsic(link_name, "avx512vbmi")?;
+                if !unprefixed_name.ends_with("512") {
+                    this.expect_target_feature_for_intrinsic(link_name, "avx512vl")?;
+                }
+
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
+
+                permute(this, left, right, dest)?;
+            }
+            // Used to implement the _mm512_permutex2var_epi64 intrinsic.
+            "vpermi2var.q.512" => {
+                let [left, indices, right] = this.check_shim_sig_unadjusted(link_name, args)?;
+
+                permute2(this, left, indices, right, dest)?;
+            }
+            // Used to implement the _mm512_permutex2var_epi8 intrinsic.
+            "vpermi2var.qi.512" => {
+                this.expect_target_feature_for_intrinsic(link_name, "avx512vbmi")?;
+
+                let [left, indices, right] = this.check_shim_sig_unadjusted(link_name, args)?;
+
+                permute2(this, left, indices, right, dest)?;
+            }
             // Used to implement the _mm512_shuffle_epi8 intrinsic.
             "pshuf.b.512" => {
-                let [left, right] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [left, right] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 pshufb(this, left, right, dest)?;
             }
@@ -126,7 +142,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.expect_target_feature_for_intrinsic(link_name, "avx512vl")?;
                 }
 
-                let [src, a, b] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [src, a, b] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 vpdpbusd(this, src, a, b, dest)?;
             }
@@ -134,7 +150,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "packsswb.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [a, b] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [a, b] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 packsswb(this, a, b, dest)?;
             }
@@ -142,7 +158,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "packuswb.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [a, b] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [a, b] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 packuswb(this, a, b, dest)?;
             }
@@ -150,7 +166,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "packssdw.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [a, b] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [a, b] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 packssdw(this, a, b, dest)?;
             }
@@ -158,13 +174,13 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "packusdw.512" => {
                 this.expect_target_feature_for_intrinsic(link_name, "avx512bw")?;
 
-                let [a, b] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let [a, b] = this.check_shim_sig_unadjusted(link_name, args)?;
 
                 packusdw(this, a, b, dest)?;
             }
-            _ => return interp_ok(EmulateItemResult::NotSupported),
+            _ => return interp_ok(false),
         }
-        interp_ok(EmulateItemResult::NeedsReturn)
+        interp_ok(true)
     }
 }
 
@@ -188,23 +204,26 @@ fn vpdpbusd<'tcx>(
     let (b, b_len) = ecx.project_to_simd(b)?;
     let (dest, dest_len) = ecx.project_to_simd(dest)?;
 
-    // fn vpdpbusd(src: i32x16, a: i32x16, b: i32x16) -> i32x16;
-    // fn vpdpbusd256(src: i32x8, a: i32x8, b: i32x8) -> i32x8;
-    // fn vpdpbusd128(src: i32x4, a: i32x4, b: i32x4) -> i32x4;
-    assert_eq!(dest_len, src_len);
-    assert_eq!(dest_len, a_len);
-    assert_eq!(dest_len, b_len);
+    // fn vpdpbusd(src: i32x16, a: u8x64, b: i8x64) -> i32x16;
+    // fn vpdpbusd256(src: i32x8, a: u8x32, b: i8x32) -> i32x8;
+    // fn vpdpbusd128(src: i32x4, a: u8x16, b: i8x16) -> i32x4;
+    assert_eq!(src_len, dest_len);
+    assert_eq!(a_len, dest_len.strict_mul(4));
+    assert_eq!(b_len, a_len);
 
     for i in 0..dest_len {
         let src = ecx.read_scalar(&ecx.project_index(&src, i)?)?.to_i32()?;
-        let a = ecx.read_scalar(&ecx.project_index(&a, i)?)?.to_u32()?;
-        let b = ecx.read_scalar(&ecx.project_index(&b, i)?)?.to_u32()?;
         let dest = ecx.project_index(&dest, i)?;
 
-        let zipped = a.to_le_bytes().into_iter().zip(b.to_le_bytes());
-        let intermediate_sum: i32 = zipped
-            .map(|(a, b)| i32::from(a).strict_mul(i32::from(b.cast_signed())))
-            .fold(0, |x, y| x.strict_add(y));
+        let mut intermediate_sum: i32 = 0;
+        for j in 0..4 {
+            let idx = i.strict_mul(4).strict_add(j);
+            let a = ecx.read_scalar(&ecx.project_index(&a, idx)?)?.to_u8()?;
+            let b = ecx.read_scalar(&ecx.project_index(&b, idx)?)?.to_i8()?;
+
+            let product = i32::from(a).strict_mul(i32::from(b));
+            intermediate_sum = intermediate_sum.strict_add(product);
+        }
 
         // Use `wrapping_add` because `src` is an arbitrary i32 and the addition can overflow.
         let res = Scalar::from_i32(intermediate_sum.wrapping_add(src));

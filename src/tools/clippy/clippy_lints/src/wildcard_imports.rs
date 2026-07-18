@@ -100,6 +100,8 @@ declare_clippy_lint! {
     "lint `use _::*` statements"
 }
 
+impl_lint_pass!(WildcardImports => [ENUM_GLOB_USE, WILDCARD_IMPORTS]);
+
 pub struct WildcardImports {
     warn_on_all: bool,
     allowed_segments: FxHashSet<String>,
@@ -114,8 +116,6 @@ impl WildcardImports {
     }
 }
 
-impl_lint_pass!(WildcardImports => [ENUM_GLOB_USE, WILDCARD_IMPORTS]);
-
 impl LateLintPass<'_> for WildcardImports {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
         if cx.sess().is_test_crate() || item.span.in_external_macro(cx.sess().source_map()) {
@@ -123,7 +123,7 @@ impl LateLintPass<'_> for WildcardImports {
         }
 
         let module = cx.tcx.parent_module_from_def_id(item.owner_id.def_id);
-        if cx.tcx.visibility(item.owner_id.def_id) != ty::Visibility::Restricted(module.to_def_id())
+        if cx.tcx.local_visibility(item.owner_id.def_id) != ty::Visibility::Restricted(module)
             && !self.warn_on_all
         {
             return;

@@ -3,11 +3,12 @@ use std::ffi::CString;
 use bitflags::Flags;
 use llvm::Linkage::*;
 use rustc_abi::Align;
+use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods};
 use rustc_middle::bug;
-use rustc_middle::ty::offload_meta::{MappingFlags, OffloadMetadata};
+use rustc_middle::ty::offload_meta::{MappingFlags, OffloadMetadata, OffloadSize};
 
 use crate::builder::Builder;
 use crate::common::CodegenCx;
@@ -318,25 +319,26 @@ impl KernelArgsTy {
         geps: [&'ll Value; 3],
         workgroup_dims: &'ll Value,
         thread_dims: &'ll Value,
-    ) -> [(Align, &'ll Value); 13] {
+        dyn_cache: &'ll Value,
+    ) -> [(Align, &'ll str, &'ll Value); 13] {
         let four = Align::from_bytes(4).expect("4 Byte alignment should work");
         let eight = Align::EIGHT;
 
         [
-            (four, cx.get_const_i32(KernelArgsTy::OFFLOAD_VERSION)),
-            (four, cx.get_const_i32(num_args)),
-            (eight, geps[0]),
-            (eight, geps[1]),
-            (eight, geps[2]),
-            (eight, memtransfer_types),
+            (four, "Version", cx.get_const_i32(KernelArgsTy::OFFLOAD_VERSION)),
+            (four, "NumArgs", cx.get_const_i32(num_args)),
+            (eight, "ArgBasePtrs", geps[0]),
+            (eight, "ArgPtrs", geps[1]),
+            (eight, "ArgSizes", geps[2]),
+            (eight, "ArgTypes", memtransfer_types),
             // The next two are debug infos. FIXME(offload): set them
-            (eight, cx.const_null(cx.type_ptr())), // dbg
-            (eight, cx.const_null(cx.type_ptr())), // dbg
-            (eight, cx.get_const_i64(KernelArgsTy::TRIPCOUNT)),
-            (eight, cx.get_const_i64(KernelArgsTy::FLAGS)),
-            (four, workgroup_dims),
-            (four, thread_dims),
-            (four, cx.get_const_i32(0)),
+            (eight, "ArgNames", cx.const_null(cx.type_ptr())), // dbg
+            (eight, "ArgMappers", cx.const_null(cx.type_ptr())), // dbg
+            (eight, "Tripcount", cx.get_const_i64(KernelArgsTy::TRIPCOUNT)),
+            (eight, "Flags", cx.get_const_i64(KernelArgsTy::FLAGS)),
+            (four, "NumTeams", workgroup_dims),
+            (four, "ThreadLimit", thread_dims),
+            (four, "DynCGroupMem", dyn_cache),
         ]
     }
 }
@@ -447,10 +449,23 @@ pub(crate) fn gen_define_handling<'ll>(
         transfer.iter().map(|m| m.intersection(valid_begin_mappings).bits()).collect();
     let transfer_from: Vec<u64> =
         transfer.iter().map(|m| m.intersection(MappingFlags::FROM).bits()).collect();
+    let valid_kernel_mappings = MappingFlags::LITERAL | MappingFlags::IMPLICIT;
     // FIXME(offload): add `OMP_MAP_TARGET_PARAM = 0x20` only if necessary
-    let transfer_kernel = vec![MappingFlags::TARGET_PARAM.bits(); transfer_to.len()];
+    let transfer_kernel: Vec<u64> = transfer
+        .iter()
+        .map(|m| (m.intersection(valid_kernel_mappings) | MappingFlags::TARGET_PARAM).bits())
+        .collect();
 
-    let offload_sizes = add_priv_unnamed_arr(&cx, &format!(".offload_sizes.{symbol}"), &sizes);
+    let actual_sizes = sizes
+        .iter()
+        .map(|s| match s {
+            OffloadSize::Static(sz) => *sz,
+            // NOTE(Sa4dUs): set `.offload_sizes` entry to 0 for sizes that we determine at runtime, just like clang
+            _ => 0,
+        })
+        .collect::<Vec<_>>();
+    let offload_sizes =
+        add_priv_unnamed_arr(&cx, &format!(".offload_sizes.{symbol}"), &actual_sizes);
     let memtransfer_begin =
         add_priv_unnamed_arr(&cx, &format!(".offload_maptypes.{symbol}.begin"), &transfer_to);
     let memtransfer_kernel =
@@ -499,9 +514,6 @@ pub(crate) fn gen_define_handling<'ll>(
         region_id,
     };
 
-    // FIXME(Sa4dUs): use this global for constant offload sizes
-    cx.add_compiler_used_global(result.offload_sizes);
-
     cx.offload_kernel_cache.borrow_mut().insert(symbol, result);
 
     result
@@ -535,6 +547,23 @@ pub(crate) fn scalar_width<'ll>(cx: &'ll SimpleCx<'_>, ty: &'ll Type) -> u64 {
     }
 }
 
+fn get_runtime_size<'ll, 'tcx>(
+    builder: &mut Builder<'_, 'll, 'tcx>,
+    args: &[&'ll Value],
+    index: usize,
+    meta: &OffloadMetadata,
+) -> &'ll Value {
+    match meta.payload_size {
+        OffloadSize::Slice { element_size } => {
+            let length_idx = index + 1;
+            let length = args[length_idx];
+            let length_i64 = builder.intcast(length, builder.cx.type_i64(), false);
+            builder.mul(length_i64, builder.cx.get_const_i64(element_size))
+        }
+        _ => bug!("unexpected offload size {:?}", meta.payload_size),
+    }
+}
+
 // For each kernel *call*, we now use some of our previous declared globals to move data to and from
 // the gpu. For now, we only handle the data transfer part of it.
 // If two consecutive kernels use the same memory, we still move it to the host and back to the gpu.
@@ -561,17 +590,20 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
     metadata: &[OffloadMetadata],
     offload_globals: &OffloadGlobals<'ll>,
     offload_dims: &OffloadKernelDims<'ll>,
+    dyn_cache: &'ll Value,
 ) {
     let cx = builder.cx;
     let OffloadKernelGlobals {
+        offload_sizes,
         memtransfer_begin,
         memtransfer_kernel,
         memtransfer_end,
         region_id,
-        ..
     } = offload_data;
     let OffloadKernelDims { num_workgroups, threads_per_block, workgroup_dims, thread_dims } =
         offload_dims;
+
+    let has_dynamic = metadata.iter().any(|m| !matches!(m.payload_size, OffloadSize::Static(_)));
 
     let tgt_decl = offload_globals.launcher_fn;
     let tgt_target_kernel_ty = offload_globals.launcher_ty;
@@ -596,7 +628,24 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
     let a2 = builder.direct_alloca(ty, Align::EIGHT, ".offload_ptrs");
     // These represent the sizes in bytes, e.g. the entry for `&[f64; 16]` will be 8*16.
     let ty2 = cx.type_array(cx.type_i64(), num_args);
-    let a4 = builder.direct_alloca(ty2, Align::EIGHT, ".offload_sizes");
+
+    let a4 = if has_dynamic {
+        let alloc = builder.direct_alloca(ty2, Align::EIGHT, ".offload_sizes");
+
+        builder.memcpy(
+            alloc,
+            Align::EIGHT,
+            offload_sizes,
+            Align::EIGHT,
+            cx.get_const_i64(8 * args.len() as u64),
+            MemFlags::empty(),
+            None,
+        );
+
+        alloc
+    } else {
+        offload_sizes
+    };
 
     //%kernel_args = alloca %struct.__tgt_kernel_arguments, align 8
     let a5 = builder.direct_alloca(tgt_kernel_decl, Align::EIGHT, "kernel_args");
@@ -648,9 +697,12 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
         builder.store(vals[i as usize], gep1, Align::EIGHT);
         let gep2 = builder.inbounds_gep(ty, a2, &[i32_0, idx]);
         builder.store(geps[i as usize], gep2, Align::EIGHT);
-        let gep3 = builder.inbounds_gep(ty2, a4, &[i32_0, idx]);
-        // FIXME(offload): write an offload frontend and handle arbitrary types.
-        builder.store(cx.get_const_i64(metadata[i as usize].payload_size), gep3, Align::EIGHT);
+
+        if !matches!(metadata[i as usize].payload_size, OffloadSize::Static(_)) {
+            let gep3 = builder.inbounds_gep(ty2, a4, &[i32_0, idx]);
+            let size_val = get_runtime_size(builder, args, i as usize, &metadata[i as usize]);
+            builder.store(size_val, gep3, Align::EIGHT);
+        }
     }
 
     // For now we have a very simplistic indexing scheme into our
@@ -662,13 +714,14 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
         a1: &'ll Value,
         a2: &'ll Value,
         a4: &'ll Value,
+        is_dynamic: bool,
     ) -> [&'ll Value; 3] {
         let cx = builder.cx;
         let i32_0 = cx.get_const_i32(0);
 
         let gep1 = builder.inbounds_gep(ty, a1, &[i32_0, i32_0]);
         let gep2 = builder.inbounds_gep(ty, a2, &[i32_0, i32_0]);
-        let gep3 = builder.inbounds_gep(ty2, a4, &[i32_0, i32_0]);
+        let gep3 = if is_dynamic { builder.inbounds_gep(ty2, a4, &[i32_0, i32_0]) } else { a4 };
         [gep1, gep2, gep3]
     }
 
@@ -692,7 +745,7 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
 
     // Step 2)
     let s_ident_t = offload_globals.ident_t_global;
-    let geps = get_geps(builder, ty, ty2, a1, a2, a4);
+    let geps = get_geps(builder, ty, ty2, a1, a2, a4, has_dynamic);
     generate_mapper_call(
         builder,
         geps,
@@ -702,14 +755,24 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
         num_args,
         s_ident_t,
     );
-    let values =
-        KernelArgsTy::new(&cx, num_args, memtransfer_kernel, geps, workgroup_dims, thread_dims);
+    let values = KernelArgsTy::new(
+        &cx,
+        num_args,
+        memtransfer_kernel,
+        geps,
+        workgroup_dims,
+        thread_dims,
+        dyn_cache,
+    );
 
     // Step 3)
     // Here we fill the KernelArgsTy, see the documentation above
     for (i, value) in values.iter().enumerate() {
         let ptr = builder.inbounds_gep(tgt_kernel_decl, a5, &[i32_0, cx.get_const_i32(i as u64)]);
-        builder.store(value.1, ptr, value.0);
+        let name = std::ffi::CString::new(value.1).unwrap();
+        llvm::set_value_name(ptr, &name.as_bytes());
+
+        builder.store(value.2, ptr, value.0);
     }
 
     let args = vec![
@@ -725,7 +788,7 @@ pub(crate) fn gen_call_handling<'ll, 'tcx>(
     // %41 = call i32 @__tgt_target_kernel(ptr @1, i64 -1, i32 2097152, i32 256, ptr @.kernel_1.region_id, ptr %kernel_args)
 
     // Step 4)
-    let geps = get_geps(builder, ty, ty2, a1, a2, a4);
+    let geps = get_geps(builder, ty, ty2, a1, a2, a4, has_dynamic);
     generate_mapper_call(
         builder,
         geps,

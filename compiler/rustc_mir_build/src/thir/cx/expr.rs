@@ -2,10 +2,11 @@ use itertools::Itertools;
 use rustc_abi::{FIRST_VARIANT, FieldIdx, Size, VariantIdx};
 use rustc_ast::UnsafeBinderCastKind;
 use rustc_data_structures::stack::ensure_sufficient_stack;
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir::attrs::{AttributeKind, HasAttrs};
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
-use rustc_hir::{LangItem, find_attr};
+use rustc_hir::{HirId, LangItem, find_attr};
 use rustc_index::Idx;
 use rustc_middle::hir::place::{
     Place as HirPlace, PlaceBase as HirPlaceBase, ProjectionKind as HirProjectionKind,
@@ -17,14 +18,25 @@ use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AutoBorrow, AutoBorrowMutability, DerefAdjustKind, PointerCoercion,
 };
 use rustc_middle::ty::{
-    self, AdtKind, GenericArgs, InlineConstArgs, InlineConstArgsParts, ScalarInt, Ty, UpvarArgs,
+    self, AdtKind, GenericArgs, InlineConstArgs, InlineConstArgsParts, ScalarInt, SplattedDef, Ty,
+    TyCtxt, UpvarArgs,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_span::{Span, sym};
+use rustc_span::{DesugaringKind, Span};
 use tracing::{debug, info, instrument, trace};
 
-use crate::errors::*;
+use crate::diagnostics::*;
 use crate::thir::cx::ThirBuildCx;
+
+fn parsed_attrs(id: HirId, tcx: TyCtxt<'_>) -> ThinVec<AttributeKind> {
+    HasAttrs::get_attrs(id, &tcx)
+        .into_iter()
+        .filter_map(|attr| match attr {
+            hir::Attribute::Parsed(attrkind) => Some(attrkind.clone()),
+            hir::Attribute::Unparsed(_) => None,
+        })
+        .collect()
+}
 
 impl<'tcx> ThirBuildCx<'tcx> {
     /// Create a THIR expression for the given HIR expression. This expands all
@@ -58,6 +70,29 @@ impl<'tcx> ThirBuildCx<'tcx> {
 
         trace!(?expr.ty);
 
+        let mut attrs = ThinVec::new();
+
+        if let hir::ExprKind::Loop(_, _, _, span) = hir_expr.kind {
+            match span.desugaring_kind() {
+                // `for` loop desugaring puts us pretty deep down the HIR tree
+                Some(DesugaringKind::ForLoop) => {
+                    let arm = self.tcx.parent_hir_node(hir_expr.hir_id).expect_arm();
+                    let expr = self.tcx.parent_hir_node(arm.hir_id).expect_expr();
+                    std::assert_matches!(expr.kind, hir::ExprKind::Match(..));
+                    // ignore async for loops
+                    if let hir::Node::Expr(expr) = self.tcx.parent_hir_node(expr.hir_id) {
+                        std::assert_matches!(expr.kind, hir::ExprKind::DropTemps(..));
+                        attrs = parsed_attrs(expr.hir_id, self.tcx)
+                    }
+                }
+                // For loops defined with `loop` and `while`, the expr already has the attrs
+                Some(DesugaringKind::WhileLoop) | None => {
+                    attrs = parsed_attrs(hir_expr.hir_id, self.tcx);
+                }
+                _ => (),
+            }
+        }
+
         // Now apply adjustments, if any.
         if self.apply_adjustments {
             for adjustment in self.typeck_results.expr_adjustments(hir_expr) {
@@ -69,16 +104,19 @@ impl<'tcx> ThirBuildCx<'tcx> {
 
         trace!(?expr.ty, "after adjustments");
 
+        let ty = expr.ty;
+        let value = self.thir.exprs.push(expr);
+
+        if !attrs.is_empty() {
+            self.thir.attributes.insert(value, attrs);
+        }
+
         // Finally, wrap this up in the expr's scope.
         expr = Expr {
             temp_scope_id: expr_scope.local_id,
-            ty: expr.ty,
+            ty,
             span: hir_expr.span,
-            kind: ExprKind::Scope {
-                region_scope: expr_scope,
-                value: self.thir.exprs.push(expr),
-                hir_id: hir_expr.hir_id,
-            },
+            kind: ExprKind::Scope { region_scope: expr_scope, value, hir_id: hir_expr.hir_id },
         };
 
         // OK, all done!
@@ -144,12 +182,29 @@ impl<'tcx> ThirBuildCx<'tcx> {
                 adjust_span(&mut expr);
                 ExprKind::Deref { arg: self.thir.exprs.push(expr) }
             }
+            Adjust::Deref(DerefAdjustKind::Pin) => {
+                adjust_span(&mut expr);
+                // pointer = ($expr).pointer
+                let pin_ty = expr.ty.pinned_ty().expect("Deref(Pin) with non-Pin type");
+                let pointer_target = ExprKind::Field {
+                    lhs: self.thir.exprs.push(expr),
+                    variant_index: FIRST_VARIANT,
+                    name: FieldIdx::ZERO,
+                };
+                let expr = Expr { temp_scope_id, ty: pin_ty, span, kind: pointer_target };
+                // expr = *pointer
+                ExprKind::Deref { arg: self.thir.exprs.push(expr) }
+            }
             Adjust::Deref(DerefAdjustKind::Overloaded(deref)) => {
                 // We don't need to do call adjust_span here since
                 // deref coercions always start with a built-in deref.
                 let call_def_id = deref.method_call(self.tcx);
-                let overloaded_callee =
-                    Ty::new_fn_def(self.tcx, call_def_id, self.tcx.mk_args(&[expr.ty.into()]));
+                // FIXME(156581): actually instantiate the binder correctly (turbofishing/fndef changes)
+                let overloaded_callee = Ty::new_fn_def(
+                    self.tcx,
+                    call_def_id,
+                    ty::Binder::dummy(self.tcx.mk_args(&[expr.ty.into()])),
+                );
 
                 expr = Expr {
                     temp_scope_id,
@@ -178,46 +233,15 @@ impl<'tcx> ThirBuildCx<'tcx> {
             Adjust::Borrow(AutoBorrow::RawPtr(mutability)) => {
                 ExprKind::RawBorrow { mutability, arg: self.thir.exprs.push(expr) }
             }
-            Adjust::ReborrowPin(mutbl) => {
-                debug!("apply ReborrowPin adjustment");
-                // Rewrite `$expr` as `Pin { __pointer: &(mut)? *($expr).__pointer }`
-
-                // We'll need these types later on
-                let pin_ty_args = match expr.ty.kind() {
-                    ty::Adt(_, args) => args,
-                    _ => bug!("ReborrowPin with non-Pin type"),
-                };
-                let pin_ty = pin_ty_args.iter().next().unwrap().expect_ty();
-                let ptr_target_ty = match pin_ty.kind() {
-                    ty::Ref(_, ty, _) => *ty,
-                    _ => bug!("ReborrowPin with non-Ref type"),
-                };
-
-                // pointer = ($expr).__pointer
-                let pointer_target = ExprKind::Field {
-                    lhs: self.thir.exprs.push(expr),
-                    variant_index: FIRST_VARIANT,
-                    name: FieldIdx::ZERO,
-                };
-                let arg = Expr { temp_scope_id, ty: pin_ty, span, kind: pointer_target };
-                let arg = self.thir.exprs.push(arg);
-
-                // arg = *pointer
-                let expr = ExprKind::Deref { arg };
-                let arg = self.thir.exprs.push(Expr {
-                    temp_scope_id,
-                    ty: ptr_target_ty,
-                    span,
-                    kind: expr,
-                });
-
-                // expr = &mut target
+            Adjust::Borrow(AutoBorrow::Pin(mutbl)) => {
+                // expr = &pin (mut|const|) arget
                 let borrow_kind = match mutbl {
                     hir::Mutability::Mut => BorrowKind::Mut { kind: mir::MutBorrowKind::Default },
                     hir::Mutability::Not => BorrowKind::Shared,
                 };
                 let new_pin_target =
-                    Ty::new_ref(self.tcx, self.tcx.lifetimes.re_erased, ptr_target_ty, mutbl);
+                    Ty::new_ref(self.tcx, self.tcx.lifetimes.re_erased, expr.ty, mutbl);
+                let arg = self.thir.exprs.push(expr);
                 let expr = self.thir.exprs.push(Expr {
                     temp_scope_id,
                     ty: new_pin_target,
@@ -225,7 +249,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
                     kind: ExprKind::Borrow { borrow_kind, arg },
                 });
 
-                // kind = Pin { __pointer: pointer }
+                // kind = Pin { pointer }
                 let pin_did = self.tcx.require_lang_item(rustc_hir::LangItem::Pin, span);
                 let args = self.tcx.mk_args(&[new_pin_target.into()]);
                 let kind = ExprKind::Adt(Box::new(AdtExpr {
@@ -238,6 +262,13 @@ impl<'tcx> ThirBuildCx<'tcx> {
                 }));
 
                 debug!(?kind);
+                kind
+            }
+            Adjust::GenericReborrow(mutability) => {
+                let expr = self.thir.exprs.push(expr);
+                let kind =
+                    ExprKind::Reborrow { source: expr, mutability, target: adjustment.target };
+
                 kind
             }
         };
@@ -342,19 +373,26 @@ impl<'tcx> ThirBuildCx<'tcx> {
         let kind = match expr.kind {
             // Here comes the interesting stuff:
             hir::ExprKind::MethodCall(segment, receiver, args, fn_span) => {
-                // Rewrite a.b(c) into UFCS form like Trait::b(a, c)
-                let expr = self.method_callee(expr, segment.ident.span, None);
-                info!("Using method span: {:?}", expr.span);
-                let args = std::iter::once(receiver)
-                    .chain(args.iter())
-                    .map(|expr| self.mirror_expr(expr))
-                    .collect();
-                ExprKind::Call {
-                    ty: expr.ty,
-                    fun: self.thir.exprs.push(expr),
-                    args,
-                    from_hir_call: true,
-                    fn_span,
+                if self.typeck_results.is_splatted_call(expr) {
+                    // The callee has a splatted tuple argument.
+                    // rewrite `receiver.f(a, u, v)` into `receiver.f(a, #[splat] (u, v))`
+                    self.convert_splatted_callee(expr, fn_span, args, Some(receiver))
+                } else {
+                    // Rewrite a.b(c) into UFCS form like Trait::b(a, c)
+                    let expr = self.method_callee(expr, segment.ident.span, None);
+                    info!("Using method span: {:?}", expr.span);
+
+                    let args = std::iter::once(receiver)
+                        .chain(args.iter())
+                        .map(|expr| self.mirror_expr(expr))
+                        .collect();
+                    ExprKind::Call {
+                        ty: expr.ty,
+                        fun: self.thir.exprs.push(expr),
+                        args,
+                        from_hir_call: true,
+                        fn_span,
+                    }
                 }
             }
 
@@ -385,24 +423,10 @@ impl<'tcx> ThirBuildCx<'tcx> {
                         from_hir_call: true,
                         fn_span: expr.span,
                     }
-                } else if let ty::FnDef(def_id, _) = self.typeck_results.expr_ty(fun).kind()
-                    && let Some(intrinsic) = self.tcx.intrinsic(def_id)
-                    && intrinsic.name == sym::box_new
-                {
-                    // We don't actually evaluate `fun` here, so make sure that doesn't miss any side-effects.
-                    if !matches!(fun.kind, hir::ExprKind::Path(_)) {
-                        span_bug!(
-                            expr.span,
-                            "`box_new` intrinsic can only be called via path expression"
-                        );
-                    }
-                    let value = &args[0];
-                    return Expr {
-                        temp_scope_id: expr.hir_id.local_id,
-                        ty: expr_ty,
-                        span: expr.span,
-                        kind: ExprKind::Box { value: self.mirror_expr(value) },
-                    };
+                } else if self.typeck_results.is_splatted_call(expr) {
+                    // The callee has a splatted tuple argument.
+                    // rewrite `f(a, u, v)` into `f(a, #[splat] (u, v))`
+                    self.convert_splatted_callee(expr, fun.span, args, None)
                 } else {
                     // Tuple-like ADTs are represented as ExprKind::Call. We convert them here.
                     let adt_data = if let hir::ExprKind::Path(ref qpath) = fun.kind
@@ -651,7 +675,8 @@ impl<'tcx> ThirBuildCx<'tcx> {
                                             .collect(),
                                     )
                                 }
-                                hir::StructTailExpr::None => AdtExprBase::None,
+                                hir::StructTailExpr::None
+                                | hir::StructTailExpr::NoneWithError(_) => AdtExprBase::None,
                             },
                         }))
                     }
@@ -663,6 +688,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
                                     base,
                                     hir::StructTailExpr::None
                                         | hir::StructTailExpr::DefaultFields(_)
+                                        | hir::StructTailExpr::NoneWithError(_)
                                 ));
 
                                 let index = adt.variant_index_with_id(variant_id);
@@ -688,7 +714,10 @@ impl<'tcx> ThirBuildCx<'tcx> {
                                         hir::StructTailExpr::Base(base) => {
                                             span_bug!(base.span, "unexpected res: {:?}", res);
                                         }
-                                        hir::StructTailExpr::None => AdtExprBase::None,
+                                        hir::StructTailExpr::None
+                                        | hir::StructTailExpr::NoneWithError(_) => {
+                                            AdtExprBase::None
+                                        }
                                     },
                                 }))
                             }
@@ -786,8 +815,8 @@ impl<'tcx> ThirBuildCx<'tcx> {
                         }
                         hir::InlineAsmOperand::Const { ref anon_const } => {
                             let ty = self.typeck_results.node_type(anon_const.hir_id);
-                            let did = anon_const.def_id.to_def_id();
-                            let typeck_root_def_id = tcx.typeck_root_def_id(did);
+                            let did = anon_const.def_id;
+                            let typeck_root_def_id = tcx.typeck_root_def_id_local(did);
                             let parent_args = tcx.erase_and_anonymize_regions(
                                 GenericArgs::identity_for_item(tcx, typeck_root_def_id),
                             );
@@ -795,7 +824,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
                                 InlineConstArgs::new(tcx, InlineConstArgsParts { parent_args, ty })
                                     .args;
 
-                            let uneval = mir::UnevaluatedConst::new(did, args);
+                            let uneval = mir::UnevaluatedConst::new(did.to_def_id(), args);
                             let value = mir::Const::Unevaluated(uneval, ty);
                             InlineAsmOperand::Const { value, span: tcx.def_span(did) }
                         }
@@ -820,10 +849,18 @@ impl<'tcx> ThirBuildCx<'tcx> {
                     lit: ScalarInt::try_from_uint(val, Size::from_bits(32)).unwrap(),
                     user_ty: None,
                 };
+                let mk_usize_kind = |val: u64| ExprKind::NonHirLiteral {
+                    lit: ScalarInt::try_from_target_usize(val, tcx).unwrap(),
+                    user_ty: None,
+                };
                 let mk_call =
                     |thir: &mut Thir<'tcx>, ty: Ty<'tcx>, variant: VariantIdx, field: FieldIdx| {
-                        let fun_ty =
-                            Ty::new_fn_def(tcx, offset_of_intrinsic, [ty::GenericArg::from(ty)]);
+                        // FIXME(156581): actually instantiate the binder correctly (turbofishing/fndef changes)
+                        let fun_ty = Ty::new_fn_def(
+                            tcx,
+                            offset_of_intrinsic,
+                            ty::Binder::dummy([ty::GenericArg::from(ty)]),
+                        );
                         let fun = thir
                             .exprs
                             .push(mk_expr(ExprKind::ZstLiteral { user_ty: None }, fun_ty));
@@ -842,7 +879,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
                     };
 
                 let indices = self.typeck_results.offset_of_data().get(expr.hir_id).unwrap();
-                let mut expr = None::<ExprKind<'tcx>>;
+                let mut expr = None::<ExprKind<'_>>;
 
                 for &(container, variant, field) in indices.iter() {
                     let next = mk_call(&mut self.thir, container, variant, field);
@@ -856,20 +893,20 @@ impl<'tcx> ThirBuildCx<'tcx> {
                     });
                 }
 
-                expr.unwrap_or(mk_u32_kind(0))
+                expr.unwrap_or_else(|| mk_usize_kind(0))
             }
 
             hir::ExprKind::ConstBlock(ref anon_const) => {
                 let ty = self.typeck_results.node_type(anon_const.hir_id);
-                let did = anon_const.def_id.to_def_id();
-                let typeck_root_def_id = tcx.typeck_root_def_id(did);
+                let did = anon_const.def_id;
+                let typeck_root_def_id = tcx.typeck_root_def_id_local(did);
                 let parent_args = tcx.erase_and_anonymize_regions(GenericArgs::identity_for_item(
                     tcx,
                     typeck_root_def_id,
                 ));
                 let args = InlineConstArgs::new(tcx, InlineConstArgsParts { parent_args, ty }).args;
 
-                ExprKind::ConstBlock { did, args }
+                ExprKind::ConstBlock { did: did.to_def_id(), args }
             }
             // Now comes the rote stuff:
             hir::ExprKind::Repeat(v, _) => {
@@ -883,7 +920,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
             hir::ExprKind::Ret(v) => ExprKind::Return { value: v.map(|v| self.mirror_expr(v)) },
             hir::ExprKind::Become(call) => ExprKind::Become { value: self.mirror_expr(call) },
             hir::ExprKind::Break(dest, ref value) => {
-                if find_attr!(self.tcx.hir_attrs(expr.hir_id), AttributeKind::ConstContinue(_)) {
+                if find_attr!(self.tcx, expr.hir_id, ConstContinue(_)) {
                     match dest.target_id {
                         Ok(target_id) => {
                             let (Some(value), Some(_)) = (value, dest.label) else {
@@ -948,7 +985,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
                 match_source,
             },
             hir::ExprKind::Loop(body, ..) => {
-                if find_attr!(self.tcx.hir_attrs(expr.hir_id), AttributeKind::LoopMatch(_)) {
+                if find_attr!(self.tcx, expr.hir_id, LoopMatch(_)) {
                     let dcx = self.tcx.dcx();
 
                     // Accept either `state = expr` or `state = expr;`.
@@ -1136,8 +1173,8 @@ impl<'tcx> ThirBuildCx<'tcx> {
             Res::Def(DefKind::Fn, _)
             | Res::Def(DefKind::AssocFn, _)
             | Res::Def(DefKind::Ctor(_, CtorKind::Fn), _)
-            | Res::Def(DefKind::Const, _)
-            | Res::Def(DefKind::AssocConst, _) => {
+            | Res::Def(DefKind::Const { .. }, _)
+            | Res::Def(DefKind::AssocConst { .. }, _) => {
                 self.typeck_results.user_provided_types().get(hir_id).copied().map(Box::new)
             }
 
@@ -1174,7 +1211,12 @@ impl<'tcx> ThirBuildCx<'tcx> {
                 let user_ty = self.user_args_applied_to_res(expr.hir_id, Res::Def(kind, def_id));
                 debug!("method_callee: user_ty={:?}", user_ty);
                 (
-                    Ty::new_fn_def(self.tcx, def_id, self.typeck_results.node_args(expr.hir_id)),
+                    // FIXME: instantiate binder correctly (turbofish/fndex)
+                    Ty::new_fn_def(
+                        self.tcx,
+                        def_id,
+                        ty::Binder::dummy(self.typeck_results.node_args(expr.hir_id)),
+                    ),
                     user_ty,
                 )
             }
@@ -1184,6 +1226,143 @@ impl<'tcx> ThirBuildCx<'tcx> {
             ty,
             span,
             kind: ExprKind::ZstLiteral { user_ty },
+        }
+    }
+
+    fn splatted_callee(
+        &mut self,
+        expr: &hir::Expr<'_>,
+        span: Span,
+    ) -> (Expr<'tcx>, u16 /* arg_index */, u16 /* arg_count */) {
+        let SplattedDef { def_id, arg_index, arg_count } =
+            self.typeck_results.splatted_def(expr.hir_id).unwrap_or_else(|| {
+                span_bug!(expr.span, "no splatted def for function or method callee")
+            });
+
+        let expr = if let Some(def_id) = def_id {
+            // We're calling a function via a FnDef, and its possibly generic type
+            let def_kind = self.tcx.def_kind(def_id);
+            let user_ty = self.user_args_applied_to_res(expr.hir_id, Res::Def(def_kind, def_id));
+            debug!(
+                "splatted_callee FnDef: user_ty={:?} def_kind={:?} def_id={:?} arg_index={:?} arg_count={:?}",
+                user_ty, def_kind, def_id, arg_index, arg_count,
+            );
+
+            Expr {
+                temp_scope_id: expr.hir_id.local_id,
+                // FIXME(156581): actually instantiate the binder correctly (turbofishing/fndef changes)
+                ty: Ty::new_fn_def(
+                    self.tcx,
+                    def_id,
+                    ty::Binder::dummy(self.typeck_results.node_args(expr.hir_id)),
+                ),
+                span,
+                kind: ExprKind::ZstLiteral { user_ty },
+            }
+        } else {
+            // We're calling a function via a FnPtr and its type
+            // FIXME(splat): populate the side-tables for FnPtrs, using liberated_fn_sigs if needed
+            let fn_ty = self.typeck_results.expr_ty_adjusted(expr);
+            let user_ty =
+                self.typeck_results.user_provided_types().get(expr.hir_id).copied().map(Box::new);
+            debug!(
+                "splatted_callee FnPtr: user_ty={:?} fn_ty={:?} arg_index={:?} arg_count={:?}",
+                user_ty, fn_ty, arg_index, arg_count,
+            );
+
+            if !fn_ty.is_fn() {
+                span_bug!(expr.span, "splatted FnPtr side-tables are not yet implemented")
+            }
+
+            Expr {
+                temp_scope_id: expr.hir_id.local_id,
+                // Create a new FnPtr FnSig type, representing the splatted function arguments with
+                // user-supplied generic types applied
+                ty: Ty::new_fn_ptr(self.tcx, fn_ty.fn_sig(self.tcx)),
+                span,
+                kind: ExprKind::ZstLiteral { user_ty },
+            }
+        };
+
+        (expr, arg_index, arg_count)
+    }
+
+    /// The callee has a splatted tuple argument.
+    /// Rewrite a splatted call `receiver.f(a, u, v)` into `receiver.f(a, #[splat] (u, v))`.
+    /// The receiver is optional.
+    fn convert_splatted_callee(
+        &mut self,
+        expr: &hir::Expr<'_>,
+        fn_span: Span,
+        args: &'tcx [hir::Expr<'tcx>],
+        receiver: Option<&'tcx hir::Expr<'tcx>>,
+    ) -> ExprKind<'tcx> {
+        let tcx = self.tcx;
+
+        // The callee has a splatted tuple argument.
+        let (func, tupled_arg_index, tupled_args_count) = self.splatted_callee(expr, fn_span);
+        let tupled_arg_index = usize::from(tupled_arg_index);
+        let tupled_args_count = usize::from(tupled_args_count);
+
+        // Splatting an empty tuple is permitted: `a.f() -> Trait::f(a, #[splat] ())`.
+        // In that case, the tupled arg index is one past the end of the args.
+        if tupled_arg_index + tupled_args_count > args.len() {
+            span_bug!(
+                expr.span,
+                "splatted arg index out of bounds of function args: {:?} + {:?} > {:?} for function call: receiver {:?}, args {:?}",
+                tupled_arg_index,
+                tupled_args_count,
+                args.len(),
+                receiver,
+                args,
+            );
+        }
+
+        info!("Using splatted function span: {:?}", func.span);
+
+        // Split into non-tupled and tupled arguments
+        let initial_non_tupled_args =
+            args.iter().take(tupled_arg_index).map(|e| self.mirror_expr(e)).collect_vec();
+        let tupled_args = if tupled_arg_index == args.len() || tupled_args_count == 0 {
+            // Splatting an empty tuple, in the ABI this gets ignored
+            Default::default()
+        } else {
+            &args[tupled_arg_index..(tupled_arg_index + tupled_args_count)]
+        };
+        let final_non_tupled_args = args
+            .iter()
+            .skip(tupled_arg_index + tupled_args_count)
+            .map(|e| self.mirror_expr(e))
+            .collect_vec();
+
+        let tupled_arg_tys = tupled_args.iter().map(|e| self.typeck_results.expr_ty_adjusted(e));
+
+        let temp_scope_id =
+            if receiver.is_some() { func.temp_scope_id } else { expr.hir_id.local_id };
+        let tupled_args = Expr {
+            ty: Ty::new_tup_from_iter(tcx, tupled_arg_tys),
+            temp_scope_id,
+            span: expr.span,
+            kind: ExprKind::Tuple { fields: self.mirror_exprs(tupled_args) },
+        };
+
+        let tupled_args = self.thir.exprs.push(tupled_args);
+
+        let mut args =
+            if let Some(receiver) = receiver { vec![self.mirror_expr(receiver)] } else { vec![] };
+        args.extend(initial_non_tupled_args);
+        args.push(tupled_args);
+        args.extend(final_non_tupled_args);
+
+        // We need the tupled arguments in HIR/MIR for type checking, but codegen can
+        // de-tuple them for performance
+        let fn_span = if receiver.is_some() { func.span } else { expr.span };
+        ExprKind::Call {
+            ty: func.ty,
+            fun: self.thir.exprs.push(func),
+            args: args.into_boxed_slice(),
+            from_hir_call: true,
+            fn_span,
         }
     }
 
@@ -1226,7 +1405,8 @@ impl<'tcx> ThirBuildCx<'tcx> {
                 ExprKind::ConstParam { param, def_id }
             }
 
-            Res::Def(DefKind::Const, def_id) | Res::Def(DefKind::AssocConst, def_id) => {
+            Res::Def(DefKind::Const { .. }, def_id)
+            | Res::Def(DefKind::AssocConst { .. }, def_id) => {
                 let user_ty = self.user_args_applied_to_res(expr.hir_id, res);
                 ExprKind::NamedConst { def_id, args, user_ty }
             }

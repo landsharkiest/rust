@@ -223,11 +223,6 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 self.print_expr(*value, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl);
             }
-            Box { value } => {
-                print_indented!(self, "Box {", depth_lvl);
-                self.print_expr(*value, depth_lvl + 1);
-                print_indented!(self, "}", depth_lvl);
-            }
             If { if_then_scope, cond, then, else_opt } => {
                 print_indented!(self, "If {", depth_lvl);
                 print_indented!(self, format!("if_then_scope: {:?}", if_then_scope), depth_lvl + 1);
@@ -362,7 +357,7 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 print_indented!(self, format!("pat: {:?}", pat), depth_lvl + 1);
                 print_indented!(self, "}", depth_lvl);
             }
-            Match { scrutinee, arms, .. } => {
+            Match { scrutinee, arms, match_source } => {
                 print_indented!(self, "Match {", depth_lvl);
                 print_indented!(self, "scrutinee:", depth_lvl + 1);
                 self.print_expr(*scrutinee, depth_lvl + 2);
@@ -372,6 +367,7 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                     self.print_arm(*arm_id, depth_lvl + 2);
                 }
                 print_indented!(self, "]", depth_lvl + 1);
+                print_indented!(self, format!("match_source: {:?}", match_source), depth_lvl + 1);
                 print_indented!(self, "}", depth_lvl);
             }
             Block { block } => self.print_block(*block, depth_lvl),
@@ -402,9 +398,10 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
             }
             Index { lhs, index } => {
                 print_indented!(self, "Index {", depth_lvl);
-                print_indented!(self, format!("index: {:?}", index), depth_lvl + 1);
                 print_indented!(self, "lhs:", depth_lvl + 1);
                 self.print_expr(*lhs, depth_lvl + 2);
+                print_indented!(self, "index:", depth_lvl + 1);
+                self.print_expr(*index, depth_lvl + 2);
                 print_indented!(self, "}", depth_lvl);
             }
             VarRef { id } => {
@@ -602,6 +599,13 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                 print_indented!(self, "Yield {", depth_lvl);
                 print_indented!(self, "value:", depth_lvl + 1);
                 self.print_expr(*value, depth_lvl + 2);
+                print_indented!(self, "}", depth_lvl);
+            }
+            ExprKind::Reborrow { source: _, mutability: _, target: _ } => {
+                print_indented!(self, "Reborrow {", depth_lvl);
+                print_indented!(self, "source:", depth_lvl + 1);
+                print_indented!(self, "mutability:", depth_lvl + 1);
+                print_indented!(self, "ty:", depth_lvl + 1);
                 print_indented!(self, "}", depth_lvl);
             }
         }
@@ -846,6 +850,14 @@ impl<'a, 'tcx> ThirPrinter<'a, 'tcx> {
                     self.print_pat(pat, depth_lvl + 3);
                 }
                 print_indented!(self, "]", depth_lvl + 2);
+                print_indented!(self, "}", depth_lvl + 1);
+            }
+            PatKind::Guard { subpattern, condition } => {
+                print_indented!(self, "Guard pattern: {", depth_lvl + 1);
+                print_indented!(self, "subpattern: ", depth_lvl + 2);
+                self.print_pat(subpattern, depth_lvl + 3);
+                print_indented!(self, "guard: ", depth_lvl + 2);
+                self.print_expr(*condition, depth_lvl + 3);
                 print_indented!(self, "}", depth_lvl + 1);
             }
             PatKind::Error(_) => {

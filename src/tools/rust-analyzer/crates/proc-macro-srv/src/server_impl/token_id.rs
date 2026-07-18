@@ -1,9 +1,6 @@
 //! proc-macro server backend based on [`proc_macro_api::msg::SpanId`] as the backing span.
 //! This backend is rather inflexible, used by RustRover and older rust-analyzer versions.
-use std::{
-    collections::{HashMap, HashSet},
-    ops::{Bound, Range},
-};
+use std::ops::{Bound, Range};
 
 use intern::Symbol;
 use rustc_proc_macro::bridge::server;
@@ -26,10 +23,6 @@ impl std::fmt::Debug for SpanId {
 type Span = SpanId;
 
 pub struct SpanIdServer<'a> {
-    // FIXME: Report this back to the caller to track as dependencies
-    pub tracked_env_vars: HashMap<Box<str>, Option<Box<str>>>,
-    // FIXME: Report this back to the caller to track as dependencies
-    pub tracked_paths: HashSet<Box<str>>,
     pub call_site: Span,
     pub def_site: Span,
     pub mixed_site: Span,
@@ -60,15 +53,13 @@ impl server::Server for SpanIdServer<'_> {
     fn injected_env_var(&mut self, _: &str) -> Option<std::string::String> {
         None
     }
-    fn track_env_var(&mut self, var: &str, value: Option<&str>) {
-        self.tracked_env_vars.insert(var.into(), value.map(Into::into));
-    }
-    fn track_path(&mut self, path: &str) {
-        self.tracked_paths.insert(path.into());
-    }
+    fn track_env_var(&mut self, _: &str, _: Option<&str>) {}
 
-    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, ()> {
+    fn track_path(&mut self, _: &str) {}
+
+    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, String> {
         literal_from_str(s, self.call_site)
+            .map_err(|()| "cannot parse string into literal".to_string())
     }
 
     fn emit_diagnostic(&mut self, _: Diagnostic<Self::Span>) {}
@@ -84,14 +75,9 @@ impl server::Server for SpanIdServer<'_> {
     fn ts_is_empty(&mut self, stream: &Self::TokenStream) -> bool {
         stream.is_empty()
     }
-    fn ts_from_str(&mut self, src: &str) -> Self::TokenStream {
-        Self::TokenStream::from_str(src, self.call_site).unwrap_or_else(|e| {
-            Self::TokenStream::from_str(
-                &format!("compile_error!(\"failed to parse str to token stream: {e}\")"),
-                self.call_site,
-            )
-            .unwrap()
-        })
+    fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
+        Self::TokenStream::from_str(src, self.call_site)
+            .map_err(|e| format!("failed to parse str to token stream: {e}"))
     }
     fn ts_to_string(&mut self, stream: &Self::TokenStream) -> String {
         stream.to_string()

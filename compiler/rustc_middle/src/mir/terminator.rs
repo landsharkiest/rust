@@ -5,8 +5,10 @@ use std::slice;
 use rustc_ast::InlineAsmOptions;
 use rustc_data_structures::packed::Pu128;
 use rustc_hir::LangItem;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_hir::attrs::AttributeKind;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use smallvec::{SmallVec, smallvec};
+use thin_vec::ThinVec;
 
 use super::*;
 
@@ -208,6 +210,7 @@ impl<O> AssertKind<O> {
                 LangItem::PanicGenFnNonePanic
             }
             NullPointerDereference => LangItem::PanicNullPointerDereference,
+            NullReferenceConstructed => LangItem::PanicNullReferenceConstructed,
             InvalidEnumConstruction(_) => LangItem::PanicInvalidEnumConstruction,
             ResumedAfterDrop(CoroutineKind::Coroutine(_)) => LangItem::PanicCoroutineResumedDrop,
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
@@ -285,6 +288,7 @@ impl<O> AssertKind<O> {
                 )
             }
             NullPointerDereference => write!(f, "\"null pointer dereference occurred\""),
+            NullReferenceConstructed => write!(f, "\"null reference produced\""),
             InvalidEnumConstruction(source) => {
                 write!(f, "\"trying to construct an enum from an invalid value {{}}\", {source:?}")
             }
@@ -326,128 +330,95 @@ impl<O> AssertKind<O> {
             }
         }
     }
+}
 
-    /// Format the diagnostic message for use in a lint (e.g. when the assertion fails during const-eval).
-    ///
-    /// Needs to be kept in sync with the run-time behavior (which is defined by
-    /// `AssertKind::panic_function` and the lang items mentioned in its docs).
-    /// Note that we deliberately show more details here than we do at runtime, such as the actual
-    /// numbers that overflowed -- it is much easier to do so here than at runtime.
-    pub fn diagnostic_message(&self) -> DiagMessage {
+/// Format the diagnostic message for use in a lint (e.g. when the assertion fails during const-eval).
+///
+/// Needs to be kept in sync with the run-time behavior (which is defined by
+/// `AssertKind::panic_function` and the lang items mentioned in its docs).
+/// Note that we deliberately show more details here than we do at runtime, such as the actual
+/// numbers that overflowed -- it is much easier to do so here than at runtime.
+impl<O: fmt::Debug> fmt::Display for AssertKind<O> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         use AssertKind::*;
 
         match self {
-            BoundsCheck { .. } => {
-                msg!("index out of bounds: the length is {$len} but the index is {$index}")
+            BoundsCheck { len, index } => {
+                write!(f, "index out of bounds: the length is {len:?} but the index is {index:?}")
             }
-            Overflow(BinOp::Shl, _, _) => {
-                msg!("attempt to shift left by `{$val}`, which would overflow")
+            Overflow(BinOp::Shl, _, val) => {
+                write!(f, "attempt to shift left by `{val:#?}`, which would overflow")
             }
-            Overflow(BinOp::Shr, _, _) => {
-                msg!("attempt to shift right by `{$val}`, which would overflow")
+            Overflow(BinOp::Shr, _, val) => {
+                write!(f, "attempt to shift right by `{val:#?}`, which would overflow")
             }
-            Overflow(_, _, _) => {
-                msg!("attempt to compute `{$left} {$op} {$right}`, which would overflow")
+            Overflow(binop, left, right) => {
+                write!(
+                    f,
+                    "attempt to compute `{left:#?} {op} {right:#?}`, which would overflow",
+                    op = binop.to_hir_binop().as_str()
+                )
             }
-            OverflowNeg(_) => msg!("attempt to negate `{$val}`, which would overflow"),
-            DivisionByZero(_) => msg!("attempt to divide `{$val}` by zero"),
-            RemainderByZero(_) => {
-                msg!("attempt to calculate the remainder of `{$val}` with a divisor of zero")
+            OverflowNeg(val) => write!(f, "attempt to negate `{val:#?}`, which would overflow"),
+            DivisionByZero(val) => write!(f, "attempt to divide `{val:#?}` by zero"),
+            RemainderByZero(val) => {
+                write!(f, "attempt to calculate the remainder of `{val:#?}` with a divisor of zero")
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                msg!("`async fn` resumed after completion")
+                write!(f, "`async fn` resumed after completion")
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterReturn(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
                 bug!("gen blocks can be resumed after they return and will keep returning `None`")
             }
             ResumedAfterReturn(CoroutineKind::Coroutine(_)) => {
-                msg!("coroutine resumed after completion")
+                write!(f, "coroutine resumed after completion")
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                msg!("`async fn` resumed after panicking")
+                write!(f, "`async fn` resumed after panicking")
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterPanic(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
-                msg!("`gen` fn or block cannot be further iterated on after it panicked")
+                write!(f, "`gen` fn or block cannot be further iterated on after it panicked")
             }
             ResumedAfterPanic(CoroutineKind::Coroutine(_)) => {
-                msg!("coroutine resumed after panicking")
+                write!(f, "coroutine resumed after panicking")
             }
-            NullPointerDereference => msg!("null pointer dereference occurred"),
-            InvalidEnumConstruction(_) => {
-                msg!("trying to construct an enum from an invalid value `{$source}`")
+            NullPointerDereference => write!(f, "null pointer dereference occurred"),
+            NullReferenceConstructed => write!(f, "null reference produced"),
+            InvalidEnumConstruction(source) => {
+                write!(f, "trying to construct an enum from an invalid value `{source:#?}`")
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Async, _)) => {
-                msg!("`async fn` resumed after async drop")
+                write!(f, "`async fn` resumed after async drop")
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::AsyncGen, _)) => {
-                todo!()
+                unimplemented!()
             }
             ResumedAfterDrop(CoroutineKind::Desugared(CoroutineDesugaring::Gen, _)) => {
-                msg!("`gen` fn or block cannot be further iterated on after it async dropped")
+                write!(f, "`gen` fn or block cannot be further iterated on after it async dropped")
             }
             ResumedAfterDrop(CoroutineKind::Coroutine(_)) => {
-                msg!("coroutine resumed after async drop")
+                write!(f, "coroutine resumed after async drop")
             }
 
-            MisalignedPointerDereference { .. } => msg!(
-                "misaligned pointer dereference: address must be a multiple of {$required} but is {$found}"
+            MisalignedPointerDereference { required, found } => write!(
+                f,
+                "misaligned pointer dereference: address must be a multiple of {required:#?} but is {found:#?}"
             ),
-        }
-    }
-
-    pub fn add_args(self, adder: &mut dyn FnMut(DiagArgName, DiagArgValue))
-    where
-        O: fmt::Debug,
-    {
-        use AssertKind::*;
-
-        macro_rules! add {
-            ($name: expr, $value: expr) => {
-                adder($name.into(), $value.into_diag_arg(&mut None));
-            };
-        }
-
-        match self {
-            BoundsCheck { len, index } => {
-                add!("len", format!("{len:?}"));
-                add!("index", format!("{index:?}"));
-            }
-            Overflow(BinOp::Shl | BinOp::Shr, _, val)
-            | DivisionByZero(val)
-            | RemainderByZero(val)
-            | OverflowNeg(val) => {
-                add!("val", format!("{val:#?}"));
-            }
-            Overflow(binop, left, right) => {
-                add!("op", binop.to_hir_binop().as_str());
-                add!("left", format!("{left:#?}"));
-                add!("right", format!("{right:#?}"));
-            }
-            ResumedAfterReturn(_)
-            | ResumedAfterPanic(_)
-            | NullPointerDereference
-            | ResumedAfterDrop(_) => {}
-            MisalignedPointerDereference { required, found } => {
-                add!("required", format!("{required:#?}"));
-                add!("found", format!("{found:#?}"));
-            }
-            InvalidEnumConstruction(source) => {
-                add!("source", format!("{source:#?}"));
-            }
         }
     }
 }
 
-#[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[derive(Clone, TyEncodable, TyDecodable, StableHash, TypeFoldable, TypeVisitable)]
 pub struct Terminator<'tcx> {
     pub source_info: SourceInfo,
     pub kind: TerminatorKind<'tcx>,
+    pub attributes: ThinVec<AttributeKind>,
 }
 
 impl<'tcx> Terminator<'tcx> {
@@ -510,7 +481,6 @@ impl<'tcx> TerminatorKind<'tcx> {
 }
 
 pub use helper::*;
-use rustc_errors::msg;
 
 mod helper {
     use super::*;
@@ -710,7 +680,7 @@ impl<'tcx> TerminatorKind<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub enum TerminatorEdges<'mir, 'tcx> {
     /// For terminators that have no successor, like `return`.
     None,
@@ -722,7 +692,7 @@ pub enum TerminatorEdges<'mir, 'tcx> {
     Double(BasicBlock, BasicBlock),
     /// Special action for `Yield`, `Call` and `InlineAsm` terminators.
     AssignOnReturn {
-        return_: &'mir [BasicBlock],
+        return_: SmallVec<[BasicBlock; 1]>,
         /// The cleanup block, if it exists.
         cleanup: Option<BasicBlock>,
         place: CallReturnPlaces<'mir, 'tcx>,
@@ -779,7 +749,7 @@ impl<'tcx> TerminatorKind<'tcx> {
             // FIXME: Maybe we need also TerminatorEdges::Trio for async drop
             // (target + unwind + dropline)
             Assert { target, unwind, expected: _, msg: _, cond: _ }
-            | Drop { target, unwind, place: _, replace: _, drop: _, async_fut: _ }
+            | Drop { target, unwind, place: _, replace: _, drop: _ }
             | FalseUnwind { real_target: target, unwind } => match unwind {
                 UnwindAction::Cleanup(unwind) => TerminatorEdges::Double(target, unwind),
                 UnwindAction::Continue | UnwindAction::Terminate(_) | UnwindAction::Unreachable => {
@@ -791,27 +761,21 @@ impl<'tcx> TerminatorKind<'tcx> {
                 TerminatorEdges::Double(real_target, imaginary_target)
             }
 
-            Yield { resume: ref target, drop, resume_arg, value: _ } => {
+            Yield { resume: target, drop, resume_arg, value: _ } => {
                 TerminatorEdges::AssignOnReturn {
-                    return_: slice::from_ref(target),
-                    cleanup: drop,
+                    return_: [target].into_iter().chain(drop.into_iter()).collect(),
+                    cleanup: None,
                     place: CallReturnPlaces::Yield(resume_arg),
                 }
             }
 
-            Call {
-                unwind,
-                destination,
-                ref target,
-                func: _,
-                args: _,
-                fn_span: _,
-                call_source: _,
-            } => TerminatorEdges::AssignOnReturn {
-                return_: target.as_ref().map(slice::from_ref).unwrap_or_default(),
-                cleanup: unwind.cleanup_block(),
-                place: CallReturnPlaces::Call(destination),
-            },
+            Call { unwind, destination, target, func: _, args: _, fn_span: _, call_source: _ } => {
+                TerminatorEdges::AssignOnReturn {
+                    return_: target.into_iter().collect(),
+                    cleanup: unwind.cleanup_block(),
+                    place: CallReturnPlaces::Call(destination),
+                }
+            }
 
             InlineAsm {
                 asm_macro: _,
@@ -822,7 +786,7 @@ impl<'tcx> TerminatorKind<'tcx> {
                 ref targets,
                 unwind,
             } => TerminatorEdges::AssignOnReturn {
-                return_: targets,
+                return_: targets.iter().copied().collect(),
                 cleanup: unwind.cleanup_block(),
                 place: CallReturnPlaces::InlineAsm(operands),
             },

@@ -2,11 +2,12 @@ use rustc_ast::TraitObjectSyntax;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::codes::*;
 use rustc_errors::{
-    Applicability, Diag, EmissionGuarantee, StashKey, Suggestions, struct_span_code_err,
+    Applicability, Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, StashKey,
+    Suggestions, struct_span_code_err,
 };
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir::{self as hir, HirId, LangItem};
 use rustc_lint_defs::builtin::{BARE_TRAIT_OBJECTS, UNUSED_ASSOCIATED_TYPE_BOUNDS};
 use rustc_middle::ty::elaborate::ClauseWithSupertraitSpan;
 use rustc_middle::ty::{
@@ -22,7 +23,7 @@ use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
 
 use super::HirTyLowerer;
-use crate::errors::DynTraitAssocItemBindingMentionsSelf;
+use crate::diagnostics::DynTraitAssocItemBindingMentionsSelf;
 use crate::hir_ty_lowering::{
     GenericArgCountMismatch, ImpliedBoundsContext, OverlappingAsssocItemConstraints,
     PredicateFilter, RegionInferReason,
@@ -230,8 +231,9 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         ordered_associated_items.extend(
                             tcx.associated_items(pred.trait_ref.def_id)
                                 .in_definition_order()
-                                // Only associated types & consts can possibly be constrained via a binding.
-                                .filter(|item| item.is_type() || item.is_const())
+                                // Only associated types & type consts can possibly be
+                                // constrained in a trait object type via a binding.
+                                .filter(|item| item.is_type() || item.is_type_const())
                                 // Traits with RPITITs are simply not dyn compatible (for now).
                                 .filter(|item| !item.is_impl_trait_in_trait())
                                 .map(|item| (item.def_id, trait_ref)),
@@ -295,7 +297,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     UNUSED_ASSOCIATED_TYPE_BOUNDS,
                     hir_id,
                     span,
-                    crate::errors::UnusedAssociatedTypeBounds { span },
+                    crate::diagnostics::UnusedAssociatedTypeBounds { span },
                 );
             }
         }
@@ -432,36 +434,41 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
         // N.b. principal, projections, auto traits
         // FIXME: This is actually wrong with multiple principals in regards to symbol mangling
-        let mut v = principal_trait_ref
+        let mut predicates = principal_trait_ref
             .into_iter()
             .chain(existential_projections)
             .chain(auto_trait_predicates)
             .collect::<SmallVec<[_; 8]>>();
-        v.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
-        let existential_predicates = tcx.mk_poly_existential_predicates(&v);
+        predicates.sort_by(|a, b| a.skip_binder().stable_cmp(tcx, &b.skip_binder()));
+        let predicates = tcx.mk_poly_existential_predicates(&predicates);
 
-        // Use explicitly-specified region bound, unless the bound is missing.
-        let region_bound = if !lifetime.is_elided() {
-            self.lower_lifetime(lifetime, RegionInferReason::ExplicitObjectLifetime)
+        let region_bound = self.lower_trait_object_lifetime(lifetime, predicates, span);
+
+        Ty::new_dynamic(tcx, predicates, region_bound)
+    }
+
+    fn lower_trait_object_lifetime(
+        &self,
+        lifetime: &hir::Lifetime,
+        predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
+        span: Span,
+    ) -> ty::Region<'tcx> {
+        // Curiously, we also use the *object region bound* for `Infer` (`'_`)
+        // while we obviously don't use the *object lifetime default* for it...
+        if let hir::LifetimeKind::ImplicitObjectLifetimeDefault | hir::LifetimeKind::Infer =
+            lifetime.kind
+            && let Some(region) = self.compute_object_lifetime_bound(span, predicates)
+        {
+            return region;
+        }
+
+        let reason = if let hir::LifetimeKind::ImplicitObjectLifetimeDefault = lifetime.kind {
+            RegionInferReason::ObjectLifetimeDefault(span.shrink_to_hi())
         } else {
-            self.compute_object_lifetime_bound(span, existential_predicates).unwrap_or_else(|| {
-                // Curiously, we prefer object lifetime default for `+ '_`...
-                if tcx.named_bound_var(lifetime.hir_id).is_some() {
-                    self.lower_lifetime(lifetime, RegionInferReason::ExplicitObjectLifetime)
-                } else {
-                    let reason =
-                        if let hir::LifetimeKind::ImplicitObjectLifetimeDefault = lifetime.kind {
-                            RegionInferReason::ObjectLifetimeDefault(span.shrink_to_hi())
-                        } else {
-                            RegionInferReason::ExplicitObjectLifetime
-                        };
-                    self.re_infer(span, reason)
-                }
-            })
+            RegionInferReason::ExplicitObjectLifetime
         };
-        debug!(?region_bound);
 
-        Ty::new_dynamic(tcx, existential_predicates, region_bound)
+        self.lower_lifetime(lifetime, reason)
     }
 
     /// Check that elaborating the principal of a trait ref doesn't lead to projections
@@ -513,6 +520,48 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         );
     }
 
+    /// Given the bounds on an object, determines what single region bound (if any) we can
+    /// use to summarize this type.
+    ///
+    /// The basic idea is that we will use the bound the user
+    /// provided, if they provided one, and otherwise search the supertypes of trait bounds
+    /// for region bounds. It may be that we can derive no bound at all, in which case
+    /// we return `None`.
+    #[instrument(level = "debug", skip(self, span), ret)]
+    fn compute_object_lifetime_bound(
+        &self,
+        span: Span,
+        existential_predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
+    ) -> Option<ty::Region<'tcx>> // if None, use the default
+    {
+        let tcx = self.tcx();
+
+        // No explicit region bound specified. Therefore, examine trait
+        // bounds and see if we can derive region bounds from those.
+        let derived_region_bounds = traits::wf::object_region_bounds(tcx, existential_predicates);
+
+        // If there are no derived region bounds, then report back that we
+        // can find no region bound. The caller will use the default.
+        if derived_region_bounds.is_empty() {
+            return None;
+        }
+
+        // If any of the derived region bounds are 'static, that is always
+        // the best choice.
+        if derived_region_bounds.iter().any(|r| r.is_static()) {
+            return Some(tcx.lifetimes.re_static);
+        }
+
+        // Determine whether there is exactly one unique region in the set
+        // of derived region bounds. If so, use that. Otherwise, report an
+        // error.
+        let r = derived_region_bounds[0];
+        if derived_region_bounds[1..].iter().any(|r1| r != *r1) {
+            self.dcx().emit_err(crate::diagnostics::AmbiguousLifetimeBound { span });
+        }
+        Some(r)
+    }
+
     /// Prohibit or lint against *bare* trait object types depending on the edition.
     ///
     /// *Bare* trait object types are ones that aren't preceded by the keyword `dyn`.
@@ -523,22 +572,35 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         hir_id: hir::HirId,
         hir_bounds: &[hir::PolyTraitRef<'tcx>],
     ) -> Option<ErrorGuaranteed> {
+        struct TraitObjectWithoutDyn<'a, 'tcx> {
+            span: Span,
+            hir_id: HirId,
+            sugg: Vec<(Span, String)>,
+            this: &'a dyn HirTyLowerer<'tcx>,
+        }
+
+        impl<'a, 'b, 'tcx> Diagnostic<'a, ()> for TraitObjectWithoutDyn<'b, 'tcx> {
+            fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+                let Self { span, hir_id, sugg, this } = self;
+                let mut lint =
+                    Diag::new(dcx, level, "trait objects without an explicit `dyn` are deprecated");
+                if span.can_be_used_for_suggestions() {
+                    lint.multipart_suggestion(
+                        "if this is a dyn-compatible trait, use `dyn`",
+                        sugg,
+                        Applicability::MachineApplicable,
+                    );
+                }
+                this.maybe_suggest_blanket_trait_impl(span, hir_id, &mut lint);
+                lint
+            }
+        }
+
         let tcx = self.tcx();
         let [poly_trait_ref, ..] = hir_bounds else { return None };
 
-        let in_path = match tcx.parent_hir_node(hir_id) {
-            hir::Node::Ty(hir::Ty {
-                kind: hir::TyKind::Path(hir::QPath::TypeRelative(qself, _)),
-                ..
-            })
-            | hir::Node::Expr(hir::Expr {
-                kind: hir::ExprKind::Path(hir::QPath::TypeRelative(qself, _)),
-                ..
-            })
-            | hir::Node::PatExpr(hir::PatExpr {
-                kind: hir::PatExprKind::Path(hir::QPath::TypeRelative(qself, _)),
-                ..
-            }) if qself.hir_id == hir_id => true,
+        let in_path = match tcx.parent_hir_node(hir_id).path() {
+            Some(hir::QPath::TypeRelative(qself, _)) if qself.hir_id == hir_id => true,
             _ => false,
         };
         let needs_bracket = in_path
@@ -606,17 +668,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             }
             Some(diag.emit())
         } else {
-            tcx.node_span_lint(BARE_TRAIT_OBJECTS, hir_id, span, |lint| {
-                lint.primary_message("trait objects without an explicit `dyn` are deprecated");
-                if span.can_be_used_for_suggestions() {
-                    lint.multipart_suggestion_verbose(
-                        "if this is a dyn-compatible trait, use `dyn`",
-                        sugg,
-                        Applicability::MachineApplicable,
-                    );
-                }
-                self.maybe_suggest_blanket_trait_impl(span, hir_id, lint);
-            });
+            tcx.emit_node_span_lint(
+                BARE_TRAIT_OBJECTS,
+                hir_id,
+                span,
+                TraitObjectWithoutDyn { span, hir_id, sugg, this: self },
+            );
             None
         }
     }
@@ -674,7 +731,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         } else {
             sugg.push((generics.where_clause_span, format!("<{param}: {}>", rendered_ty)));
         }
-        diag.multipart_suggestion_verbose(
+        diag.multipart_suggestion(
             "you might be missing a type parameter",
             sugg,
             Applicability::MachineApplicable,
@@ -785,7 +842,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
 
         // FIXME: Only emit this suggestion if the trait is dyn-compatible.
-        diag.multipart_suggestion_verbose(
+        diag.multipart_suggestion(
             "you can add the `dyn` keyword if you want a trait object",
             sugg,
             Applicability::MachineApplicable,
@@ -871,7 +928,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                  single underlying type",
             );
 
-            diag.multipart_suggestion_verbose(msg, impl_sugg, Applicability::MachineApplicable);
+            diag.multipart_suggestion(msg, impl_sugg, Applicability::MachineApplicable);
 
             // Suggest `Box<dyn Trait>` for return type
             if is_dyn_compatible {
@@ -887,7 +944,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     ]
                 };
 
-                diag.multipart_suggestion_verbose(
+                diag.multipart_suggestion(
                     "alternatively, you can return an owned trait object",
                     suggestion,
                     Applicability::MachineApplicable,
@@ -902,12 +959,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 continue;
             }
             let sugg = self.add_generic_param_suggestion(generics, span, &trait_name);
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 format!("use a new generic type parameter, constrained by `{trait_name}`"),
                 sugg,
                 Applicability::MachineApplicable,
             );
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 "you can also use an opaque type, but users won't be able to specify the type \
                  parameter when calling the `fn`, having to rely exclusively on type inference",
                 impl_sugg,
@@ -931,7 +988,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 } else {
                     vec![(span.shrink_to_lo(), dyn_str.to_string())]
                 };
-                diag.multipart_suggestion_verbose(
+                diag.multipart_suggestion(
                     format!(
                         "alternatively, use a trait object to accept any type that implements \
                          `{trait_name}`, accessing its methods at runtime using dynamic dispatch",

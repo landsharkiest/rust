@@ -16,7 +16,7 @@ mod ty;
 pub mod asm;
 pub mod cfg_select;
 
-use std::{fmt, mem, slice};
+use std::{debug_assert_matches, fmt, mem, slice};
 
 use attr_wrapper::{AttrWrapper, UsePreAttrPos};
 pub use diagnostics::AttemptLocalParseRecovery;
@@ -30,26 +30,30 @@ use rustc_ast::token::{
 };
 use rustc_ast::tokenstream::{
     ParserRange, ParserReplacement, Spacing, TokenCursor, TokenStream, TokenTree, TokenTreeCursor,
+    WithTokens,
 };
 use rustc_ast::util::case::Case;
+use rustc_ast::util::classify;
 use rustc_ast::{
-    self as ast, AnonConst, AttrArgs, AttrId, ByRef, Const, CoroutineKind, DUMMY_NODE_ID,
-    DelimArgs, Expr, ExprKind, Extern, HasAttrs, HasTokens, MgcaDisambiguation, Mutability,
-    Recovered, Safety, StrLit, Visibility, VisibilityKind,
+    self as ast, AnonConst, AttrArgs, AttrId, BinOpKind, ByRef, Const, CoroutineKind,
+    DUMMY_NODE_ID, DelimArgs, Expr, ExprKind, Extern, HasTokens, ImplRestriction, MutRestriction,
+    Mutability, Recovered, RestrictionKind, Safety, StrLit, Visibility, VisibilityKind,
 };
 use rustc_ast_pretty::pprust;
-use rustc_data_structures::debug_assert_matches;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Applicability, Diag, FatalError, MultiSpan, PResult};
 use rustc_index::interval::IntervalSet;
 use rustc_session::parse::ParseSess;
-use rustc_span::{Ident, Span, Symbol, kw, sym};
+use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol, kw, sym};
 use thin_vec::ThinVec;
 use token_type::TokenTypeSet;
 pub use token_type::{ExpKeywordPair, ExpTokenPair, TokenType};
 use tracing::debug;
 
-use crate::errors::{self, IncorrectVisibilityRestriction, NonStringAbiLiteral, TokenDescription};
+use crate::diagnostics::{
+    IncorrectImplRestriction, IncorrectMutRestriction, IncorrectVisibilityRestriction,
+    NonStringAbiLiteral, TokenDescription,
+};
 use crate::exp;
 
 #[cfg(test)]
@@ -232,6 +236,10 @@ pub struct Parser<'a> {
     /// Whether the parser is allowed to do recovery.
     /// This is disabled when parsing macro arguments, see #103534
     recovery: Recovery = Recovery::Allowed,
+    /// Whether we're parsing a function body.
+    in_fn_body: bool = false,
+    /// Whether we have detected a missing semicolon in function body.
+    pub fn_body_missing_semi_guar: Option<ErrorGuaranteed> = None,
 }
 
 // This type is used a lot, e.g. it's cloned when matching many declarative macro rules with
@@ -287,6 +295,13 @@ impl SeqSep {
     fn none() -> SeqSep {
         SeqSep { sep: None, trailing_sep_allowed: false }
     }
+}
+
+/// Whether parsing `impl` or `mut` restrictions.
+#[derive(Clone, Copy, Debug)]
+enum ParsingRestrictionKind {
+    Impl,
+    Mut,
 }
 
 #[derive(Debug)]
@@ -401,7 +416,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Recovered::No)
             } else {
-                self.unexpected_try_recover(&exp.tok)
+                Err(self.unexpected_err(&exp.tok))
             }
         } else {
             self.expect_one_of(slice::from_ref(&exp), &[])
@@ -582,12 +597,12 @@ impl<'a> Parser<'a> {
                 (true, true) => {
                     unreachable!("keyword that is both fully upper- and fully lowercase")
                 }
-                (true, false) => errors::Case::Upper,
-                (false, true) => errors::Case::Lower,
-                (false, false) => errors::Case::Mixed,
+                (true, false) => crate::diagnostics::Case::Upper,
+                (false, true) => crate::diagnostics::Case::Lower,
+                (false, false) => crate::diagnostics::Case::Mixed,
             };
 
-            self.dcx().emit_err(errors::KwBadCase { span: ident.span, kw, case });
+            self.dcx().emit_err(crate::diagnostics::KwBadCase { span: ident.span, kw, case });
             self.bump();
             true
         } else {
@@ -902,6 +917,13 @@ impl<'a> Parser<'a> {
                             }
 
                             // Attempt to keep parsing if it was an omitted separator.
+                            // `&raw <expr>` already has a specific suggestion for missing
+                            // `const`/`mut`, so don't recover `<expr>` as the next element in
+                            // a comma-separated list.
+                            if exp.token_type == TokenType::Comma && self.is_expected_raw_ref_mut()
+                            {
+                                return Err(expect_err);
+                            }
                             self.last_unexpected_token_span = None;
                             match f(self) {
                                 Ok(t) => {
@@ -1068,7 +1090,7 @@ impl<'a> Parser<'a> {
     /// Parses a comma-separated sequence, including both delimiters.
     /// The function `f` must consume tokens until reaching the next separator or
     /// closing bracket.
-    fn parse_delim_comma_seq<T>(
+    pub fn parse_delim_comma_seq<T>(
         &mut self,
         open: ExpTokenPair,
         close: ExpTokenPair,
@@ -1276,7 +1298,6 @@ impl<'a> Parser<'a> {
         let anon_const = AnonConst {
             id: DUMMY_NODE_ID,
             value: self.mk_expr(blk.span, ExprKind::Block(blk, None)),
-            mgca_disambiguation: MgcaDisambiguation::AnonConst,
         };
         let blk_span = anon_const.value.span;
         let kind = if pat {
@@ -1294,12 +1315,16 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr_with_attrs(span.to(blk_span), kind, attrs))
     }
 
-    /// Parses mutability (`mut` or nothing).
+    /// Parse nothing or `mut`.
     fn parse_mutability(&mut self) -> Mutability {
         if self.eat_keyword(exp!(Mut)) { Mutability::Mut } else { Mutability::Not }
     }
 
-    /// Parses reference binding mode (`ref`, `ref mut`, `ref pin const`, `ref pin mut`, or nothing).
+    /// Parse nothing or a by-reference mode.
+    ///
+    /// ```ebnf
+    /// ByRef = "ref" PinAndMut?
+    /// ```
     fn parse_byref(&mut self) -> ByRef {
         if self.eat_keyword(exp!(Ref)) {
             let (pinnedness, mutability) = self.parse_pin_and_mut();
@@ -1309,8 +1334,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Possibly parses mutability (`const` or `mut`).
-    fn parse_const_or_mut(&mut self) -> Option<Mutability> {
+    /// Parse nothing or "explicit" mutability.
+    ///
+    /// ```ebnf
+    /// MutOrConst = "mut" | "const"
+    /// ```
+    fn parse_mut_or_const(&mut self) -> Option<Mutability> {
         if self.eat_keyword(exp!(Mut)) {
             Some(Mutability::Mut)
         } else if self.eat_keyword(exp!(Const)) {
@@ -1320,11 +1349,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_field_name(&mut self) -> PResult<'a, Ident> {
+    /// Parse a field name.
+    ///
+    /// ```enbf
+    /// FieldName = IntLit | Ident
+    /// ```
+    pub fn parse_field_name(&mut self) -> PResult<'a, Ident> {
         if let token::Literal(token::Lit { kind: token::Integer, symbol, suffix }) = self.token.kind
         {
             if let Some(suffix) = suffix {
-                self.dcx().emit_err(errors::InvalidLiteralSuffixOnTupleIndex {
+                self.dcx().emit_err(crate::diagnostics::InvalidLiteralSuffixOnTupleIndex {
                     span: self.token.span,
                     suffix,
                 });
@@ -1458,7 +1492,6 @@ impl<'a> Parser<'a> {
             return Ok(Visibility {
                 span: self.token.span.shrink_to_lo(),
                 kind: VisibilityKind::Inherited,
-                tokens: None,
             });
         }
         let lo = self.prev_token.span;
@@ -1479,11 +1512,7 @@ impl<'a> Parser<'a> {
                     id: ast::DUMMY_NODE_ID,
                     shorthand: false,
                 };
-                return Ok(Visibility {
-                    span: lo.to(self.prev_token.span),
-                    kind: vis,
-                    tokens: None,
-                });
+                return Ok(Visibility { span: lo.to(self.prev_token.span), kind: vis });
             } else if self.look_ahead(2, |t| t == &token::CloseParen)
                 && self.is_keyword_ahead(1, &[kw::Crate, kw::Super, kw::SelfLower])
             {
@@ -1496,11 +1525,7 @@ impl<'a> Parser<'a> {
                     id: ast::DUMMY_NODE_ID,
                     shorthand: true,
                 };
-                return Ok(Visibility {
-                    span: lo.to(self.prev_token.span),
-                    kind: vis,
-                    tokens: None,
-                });
+                return Ok(Visibility { span: lo.to(self.prev_token.span), kind: vis });
             } else if let FollowedByType::No = fbt {
                 // Provide this diagnostic if a type cannot follow;
                 // in particular, if this is not a tuple struct.
@@ -1509,7 +1534,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Visibility { span: lo, kind: VisibilityKind::Public, tokens: None })
+        Ok(Visibility { span: lo, kind: VisibilityKind::Public })
     }
 
     /// Recovery for e.g. `pub(something) fn ...` or `struct X { pub(something) y: Z }`
@@ -1523,6 +1548,88 @@ impl<'a> Parser<'a> {
             .emit_err(IncorrectVisibilityRestriction { span: path.span, inner_str: path_str });
 
         Ok(())
+    }
+
+    /// Parses an optional `impl` restriction.
+    /// Enforces the `impl_restriction` feature gate whenever an explicit restriction is encountered.
+    fn parse_impl_restriction(&mut self) -> PResult<'a, ImplRestriction> {
+        if self.eat_keyword(exp!(Impl)) {
+            let (kind, span, gated_span) = self.parse_restriction(ParsingRestrictionKind::Impl)?;
+            self.psess.gated_spans.gate(sym::impl_restriction, gated_span);
+            return Ok(ImplRestriction { kind, span });
+        }
+        Ok(ImplRestriction {
+            kind: RestrictionKind::Unrestricted,
+            span: self.token.span.shrink_to_lo(),
+        })
+    }
+
+    /// Parses an optional `mut` restriction.
+    /// Enforces the `mut_restriction` feature gate whenever an explicit restriction is encountered.
+    fn parse_mut_restriction(&mut self) -> PResult<'a, MutRestriction> {
+        if self.eat_keyword(exp!(Mut)) {
+            let (kind, span, gated_span) = self.parse_restriction(ParsingRestrictionKind::Mut)?;
+            self.psess.gated_spans.gate(sym::mut_restriction, gated_span);
+            return Ok(MutRestriction { kind, span });
+        }
+        Ok(MutRestriction {
+            kind: RestrictionKind::Unrestricted,
+            span: self.token.span.shrink_to_lo(),
+        })
+    }
+
+    /// Parses `impl` or `mut` restrictions.
+    /// Returns the parsed restriction and its span, as well as the gated span.
+    fn parse_restriction(
+        &mut self,
+        restriction_kind: ParsingRestrictionKind,
+    ) -> PResult<'a, (RestrictionKind, Span, Span)> {
+        let lo = self.prev_token.span;
+        // No units or tuples are allowed to follow `impl` or `mut` here, so we can safely bump `(`.
+        self.expect(exp!(OpenParen))?;
+        if self.eat_keyword(exp!(In)) {
+            let path = self.parse_path(PathStyle::Mod)?; // `in path`
+            self.expect(exp!(CloseParen))?; // `)`
+            let restriction = RestrictionKind::Restricted {
+                path: Box::new(path),
+                id: ast::DUMMY_NODE_ID,
+                shorthand: false,
+            };
+            let span = lo.to(self.prev_token.span);
+            Ok((restriction, span, span))
+        } else if self.look_ahead(1, |t| t == &token::CloseParen)
+            && self.is_keyword_ahead(0, &[kw::Crate, kw::Super, kw::SelfLower])
+        {
+            let path = self.parse_path(PathStyle::Mod)?; // `crate`/`super`/`self`
+            self.expect(exp!(CloseParen))?; // `)`
+            let restriction = RestrictionKind::Restricted {
+                path: Box::new(path),
+                id: ast::DUMMY_NODE_ID,
+                shorthand: true,
+            };
+            let span = lo.to(self.prev_token.span);
+            Ok((restriction, span, span))
+        } else {
+            // Emit diagnostic, but continue with no restrictions.
+            // Recovery for `impl(something) trait` or `mut (something) field`.
+            let path = self.parse_path(PathStyle::Mod)?;
+            self.expect(exp!(CloseParen))?; // `)`
+            let path_str = pprust::path_to_string(&path);
+            let end = self.prev_token.span;
+            match restriction_kind {
+                ParsingRestrictionKind::Impl => {
+                    self.dcx().emit_err(IncorrectImplRestriction {
+                        span: path.span,
+                        inner_str: path_str,
+                    });
+                }
+                ParsingRestrictionKind::Mut => {
+                    self.dcx()
+                        .emit_err(IncorrectMutRestriction { span: path.span, inner_str: path_str });
+                }
+            }
+            Ok((RestrictionKind::Unrestricted, self.token.span.shrink_to_lo(), lo.to(end)))
+        }
     }
 
     /// Parses `extern string_literal?`.
@@ -1554,7 +1661,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn collect_tokens_no_attrs<R: HasAttrs + HasTokens>(
+    fn collect_tokens_no_attrs<R: HasTokens>(
         &mut self,
         f: impl FnOnce(&mut Self) -> PResult<'a, R>,
     ) -> PResult<'a, R> {
@@ -1649,22 +1756,87 @@ impl<'a> Parser<'a> {
             _ => self.prev_token.span,
         }
     }
+
+    fn missing_semi_from_binop(
+        &self,
+        kind_desc: &str,
+        expr: &Expr,
+        decl_lo: Option<Span>,
+    ) -> Option<(Span, ErrorGuaranteed)> {
+        if self.token == TokenKind::Semi {
+            return None;
+        }
+        if !self.may_recover() || expr.span.from_expansion() {
+            return None;
+        }
+        let sm = self.psess.source_map();
+        if let ExprKind::Binary(op, lhs, rhs) = &expr.kind
+            && sm.is_multiline(lhs.span.shrink_to_hi().until(rhs.span.shrink_to_lo()))
+            && matches!(op.node, BinOpKind::Mul | BinOpKind::BitAnd)
+            && classify::expr_requires_semi_to_be_stmt(rhs)
+        {
+            let lhs_end_span = lhs.span.shrink_to_hi();
+            let token_str = token_descr(&self.token);
+            let mut err = self
+                .dcx()
+                .struct_span_err(lhs_end_span, format!("expected `;`, found {token_str}"));
+            err.span_label(self.token.span, "unexpected token");
+
+            // Use the declaration start if provided, otherwise fall back to lhs_end_span.
+            let continuation_start = decl_lo.unwrap_or(lhs_end_span);
+            let continuation_span = continuation_start.until(rhs.span.shrink_to_hi());
+            err.span_label(
+                continuation_span,
+                format!(
+                    "to finish parsing this {kind_desc}, expected this to be followed by a `;`",
+                ),
+            );
+            let op_desc = match op.node {
+                BinOpKind::BitAnd => "a bit-and",
+                BinOpKind::Mul => "a multiplication",
+                _ => "a binary",
+            };
+            let mut note_spans = MultiSpan::new();
+            note_spans.push_span_label(lhs.span, "parsed as the left-hand expression");
+            note_spans.push_span_label(rhs.span, "parsed as the right-hand expression");
+            note_spans.push_span_label(op.span, format!("this was parsed as {op_desc}"));
+            err.span_note(
+                note_spans,
+                format!("the {kind_desc} was parsed as having {op_desc} binary expression"),
+            );
+
+            err.span_suggestion(
+                lhs_end_span,
+                format!("you may have meant to write a `;` to terminate the {kind_desc} earlier"),
+                ";",
+                Applicability::MaybeIncorrect,
+            );
+            return Some((lhs.span, err.emit()));
+        }
+        None
+    }
 }
 
-// Metavar captures of various kinds.
+// Metavar captures of various kinds. The more complex node kinds (e.g. `Item`, `Expr`) store
+// tokens in the node itself because those tokens are needed for non-terminal parsing and for other
+// reasons (e.g. cfg expansion). Simpler node kinds (e.g. `Block`, `Path`) only need tokens for
+// non-terminal parsing so here they store the tokens next to the node, keeping the node size
+// smaller.
 #[derive(Clone, Debug)]
 pub enum ParseNtResult {
     Tt(TokenTree),
     Ident(Ident, IdentIsRaw),
     Lifetime(Ident, IdentIsRaw),
     Item(Box<ast::Item>),
-    Block(Box<ast::Block>),
+    Block(WithTokens<Box<ast::Block>>),
     Stmt(Box<ast::Stmt>),
-    Pat(Box<ast::Pat>, NtPatKind),
+    Pat(WithTokens<Box<ast::Pat>>, NtPatKind),
     Expr(Box<ast::Expr>, NtExprKind),
     Literal(Box<ast::Expr>),
-    Ty(Box<ast::Ty>),
-    Meta(Box<ast::AttrItem>),
-    Path(Box<ast::Path>),
-    Vis(Box<ast::Visibility>),
+    Ty(WithTokens<Box<ast::Ty>>),
+    // These tokens are for the attr item, e.g. just the `foo` within `#[foo]` or `#![foo]`.
+    Meta(WithTokens<Box<ast::AttrItem>>),
+    Path(WithTokens<Box<ast::Path>>),
+    Vis(WithTokens<Box<ast::Visibility>>),
+    Guard(Box<ast::Guard>),
 }

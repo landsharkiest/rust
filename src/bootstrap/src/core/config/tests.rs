@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::flags::Flags;
 use super::toml::change_id::ChangeIdWrapper;
+use super::toml::rust::parse_codegen_backends;
 use super::{Config, RUSTC_IF_UNCHANGED_ALLOWED_PATHS};
 use crate::ChangeId;
 use crate::core::build_steps::clippy::{LintConfig, get_clippy_rules_in_order};
@@ -32,6 +33,13 @@ fn get_toml(file: &Path) -> Result<TomlConfig, toml::de::Error> {
     toml::from_str(&contents).and_then(|table: toml::Value| TomlConfig::deserialize(table))
 }
 
+fn modified(upstream: impl Into<String>, changes: &[&str]) -> PathFreshness {
+    PathFreshness::HasLocalModifications {
+        upstream: upstream.into(),
+        modifications: changes.iter().copied().map(PathBuf::from).collect(),
+    }
+}
+
 #[test]
 fn download_ci_llvm() {
     let config = TestCtx::new().config("check").create_config();
@@ -42,7 +50,7 @@ fn download_ci_llvm() {
         .config("check")
         .with_default_toml_config("llvm.download-ci-llvm = \"if-unchanged\"")
         .create_config();
-    if if_unchanged_config.llvm_from_ci && if_unchanged_config.is_running_on_ci {
+    if if_unchanged_config.llvm_from_ci && if_unchanged_config.is_running_on_ci() {
         let has_changes = if_unchanged_config.has_changes_from_upstream(LLVM_INVALIDATION_PATHS);
 
         assert!(
@@ -197,6 +205,15 @@ fn rust_optimize() {
     assert!(parse("rust.optimize = \"s\"").rust_optimize.is_release());
     assert_eq!(parse("rust.optimize = 1").rust_optimize.get_opt_level(), Some("1".to_string()));
     assert_eq!(parse("rust.optimize = \"s\"").rust_optimize.get_opt_level(), Some("s".to_string()));
+}
+
+#[test]
+#[should_panic(expected = "Duplicate value 'llvm' for 'rust.codegen-backends'")]
+fn rejects_duplicate_codegen_backends() {
+    parse_codegen_backends(
+        vec!["llvm", "llvm", "cranelift"].into_iter().map(str::to_owned).collect(),
+        "rust",
+    );
 }
 
 #[test]
@@ -491,13 +508,14 @@ fn test_exclude() {
 #[test]
 fn test_ci_flag() {
     let config = TestCtx::new().config("check").arg("--ci").arg("false").create_config();
-    assert!(!config.is_running_on_ci);
+    assert!(!config.is_running_on_ci());
 
     let config = TestCtx::new().config("check").arg("--ci").arg("true").create_config();
-    assert!(config.is_running_on_ci);
+    assert!(config.is_running_on_ci());
 
+    // If --ci flag is not added, is_running_on_ci() relies on if it is run on actual CI or not.
     let config = TestCtx::new().config("check").create_config();
-    assert_eq!(config.is_running_on_ci, CiEnv::is_ci());
+    assert_eq!(config.is_running_on_ci(), CiEnv::is_ci());
 }
 
 #[test]
@@ -691,7 +709,7 @@ fn test_pr_ci_changed_in_pr() {
         let sha = ctx.create_upstream_merge(&["a"]);
         ctx.create_nonupstream_merge(&["b"]);
         let src = ctx.check_modifications(&["b"], CiEnv::GitHubActions);
-        assert_eq!(src, PathFreshness::HasLocalModifications { upstream: sha });
+        assert_eq!(src, modified(sha, &["b"]));
     });
 }
 
@@ -711,7 +729,7 @@ fn test_auto_ci_changed_in_pr() {
         let sha = ctx.create_upstream_merge(&["a"]);
         ctx.create_upstream_merge(&["b", "c"]);
         let src = ctx.check_modifications(&["c", "d"], CiEnv::GitHubActions);
-        assert_eq!(src, PathFreshness::HasLocalModifications { upstream: sha });
+        assert_eq!(src, modified(sha, &["c"]));
     });
 }
 
@@ -722,10 +740,7 @@ fn test_local_uncommitted_modifications() {
         ctx.create_branch("feature");
         ctx.modify("a");
 
-        assert_eq!(
-            ctx.check_modifications(&["a", "d"], CiEnv::None),
-            PathFreshness::HasLocalModifications { upstream: sha }
-        );
+        assert_eq!(ctx.check_modifications(&["a", "d"], CiEnv::None), modified(sha, &["a"]),);
     });
 }
 
@@ -740,10 +755,7 @@ fn test_local_committed_modifications() {
         ctx.modify("a");
         ctx.commit();
 
-        assert_eq!(
-            ctx.check_modifications(&["a", "d"], CiEnv::None),
-            PathFreshness::HasLocalModifications { upstream: sha }
-        );
+        assert_eq!(ctx.check_modifications(&["a", "d"], CiEnv::None), modified(sha, &["a"]),);
     });
 }
 
@@ -756,10 +768,7 @@ fn test_local_committed_modifications_subdirectory() {
         ctx.modify("a/b/d");
         ctx.commit();
 
-        assert_eq!(
-            ctx.check_modifications(&["a/b"], CiEnv::None),
-            PathFreshness::HasLocalModifications { upstream: sha }
-        );
+        assert_eq!(ctx.check_modifications(&["a/b"], CiEnv::None), modified(sha, &["a/b/d"]),);
     });
 }
 
@@ -835,11 +844,11 @@ fn test_local_changes_negative_path() {
         );
         assert_eq!(
             ctx.check_modifications(&[":!c"], CiEnv::None),
-            PathFreshness::HasLocalModifications { upstream: upstream.clone() }
+            modified(&upstream, &["b", "d"]),
         );
         assert_eq!(
             ctx.check_modifications(&[":!d", ":!x"], CiEnv::None),
-            PathFreshness::HasLocalModifications { upstream }
+            modified(&upstream, &["b"]),
         );
     });
 }

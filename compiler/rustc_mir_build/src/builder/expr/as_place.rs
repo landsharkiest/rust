@@ -1,9 +1,8 @@
 //! See docs in build/expr/mod.rs
 
-use std::iter;
+use std::{assert_matches, iter};
 
 use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
-use rustc_data_structures::assert_matches;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::hir::place::{Projection as HirProjection, ProjectionKind as HirProjectionKind};
 use rustc_middle::mir::AssertKind::BoundsCheck;
@@ -552,7 +551,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
             | ExprKind::LogicalOp { .. }
-            | ExprKind::Box { .. }
             | ExprKind::Cast { .. }
             | ExprKind::Use { .. }
             | ExprKind::NeverToAny { .. }
@@ -585,6 +583,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. }
             | ExprKind::ByUse { .. }
+            // A reborrow is an rvalue. If a place is needed for it, materialize
+            // the rvalue in a temporary instead of treating the reborrow
+            // expression itself as an assignable place.
+            | ExprKind::Reborrow { .. }
             | ExprKind::WrapUnsafeBinder { .. } => {
                 // these are not places, so we need to make a temporary.
                 debug_assert!(!matches!(Category::of(&expr.kind), Some(Category::Place)));

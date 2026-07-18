@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use ipc_channel::ipc;
+use ipc_channel::{TryRecvError, ipc};
 use nix::sys::{mman, ptrace, signal};
 use nix::unistd;
 use rustc_const_eval::interpret::{InterpResult, interp_ok};
@@ -31,7 +31,7 @@ pub struct Supervisor {
     /// Used for synchronisation, allowing us to receive confirmation that the
     /// parent process has handled the request from `message_tx`.
     confirm_rx: ipc::IpcReceiver<Confirmation>,
-    /// Receiver for memory acceses that ocurred during the FFI call.
+    /// Receiver for memory accesses that occurred during the FFI call.
     event_rx: ipc::IpcReceiver<MemEvents>,
 }
 
@@ -140,8 +140,8 @@ impl Supervisor {
             .try_recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| {
                 match e {
-                    ipc::TryRecvError::IpcError(_) => (),
-                    ipc::TryRecvError::Empty =>
+                    TryRecvError::IpcError(_) => (),
+                    TryRecvError::Empty =>
                         panic!("Waiting for accesses from supervisor timed out!"),
                 }
             })

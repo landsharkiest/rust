@@ -56,12 +56,11 @@ This API is completely unstable and subject to change.
 */
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(assert_matches))]
 #![feature(default_field_values)]
 #![feature(gen_blocks)]
-#![feature(if_let_guard)]
 #![feature(iter_intersperse)]
 #![feature(never_type)]
+#![feature(option_into_flat_iter)]
 #![feature(slice_partition_dedup)]
 #![feature(try_blocks)]
 #![feature(unwrap_infallible)]
@@ -75,24 +74,23 @@ mod check_unused;
 mod coherence;
 mod collect;
 mod constrained_generic_params;
-mod delegation;
-pub mod errors;
+pub mod delegation;
+pub mod diagnostics;
 pub mod hir_ty_lowering;
 pub mod hir_wf_check;
 mod impl_wf_check;
 mod outlives;
 mod variance;
 
-pub use errors::NoVariantNamed;
+pub use diagnostics::NoVariantNamed;
 use rustc_abi::{CVariadicStatus, ExternAbi};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
-use rustc_hir::lints::DelayedLint;
 use rustc_middle::mir::interpret::GlobalId;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{Const, Ty, TyCtxt};
 use rustc_middle::{middle, ty};
-use rustc_session::parse::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::{ErrorGuaranteed, Span};
 use rustc_trait_selection::traits;
 
@@ -100,7 +98,7 @@ pub use crate::collect::suggest_impl_trait;
 use crate::hir_ty_lowering::HirTyLowerer;
 
 fn check_c_variadic_abi(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: ExternAbi, span: Span) {
-    if !decl.c_variadic {
+    if !decl.c_variadic() {
         // Not even a variadic function.
         return;
     }
@@ -109,7 +107,7 @@ fn check_c_variadic_abi(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: ExternAbi,
         CVariadicStatus::Stable => {}
         CVariadicStatus::NotSupported => {
             tcx.dcx()
-                .create_err(errors::VariadicFunctionCompatibleConvention {
+                .create_err(diagnostics::VariadicFunctionCompatibleConvention {
                     span,
                     convention: &format!("{abi}"),
                 })
@@ -140,32 +138,13 @@ pub fn provide(providers: &mut Providers) {
         inferred_outlives_crate: outlives::inferred_outlives_crate,
         inferred_outlives_of: outlives::inferred_outlives_of,
         inherit_sig_for_delegation_item: delegation::inherit_sig_for_delegation_item,
+        delegation_user_specified_args: delegation::delegation_user_specified_args,
         enforce_impl_non_lifetime_params_are_constrained:
             impl_wf_check::enforce_impl_non_lifetime_params_are_constrained,
         crate_variances: variance::crate_variances,
         variances_of: variance::variances_of,
         ..*providers
     };
-}
-
-fn emit_delayed_lint(lint: &DelayedLint, tcx: TyCtxt<'_>) {
-    match lint {
-        DelayedLint::AttributeParsing(attribute_lint) => {
-            tcx.node_span_lint(
-                attribute_lint.lint_id.lint,
-                attribute_lint.id,
-                attribute_lint.span,
-                |diag| {
-                    rustc_lint::decorate_attribute_lint(
-                        tcx.sess,
-                        Some(tcx),
-                        &attribute_lint.kind,
-                        diag,
-                    );
-                },
-            );
-        }
-    }
 }
 
 pub fn check_crate(tcx: TyCtxt<'_>) {
@@ -176,50 +155,14 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
         // what we are intending to discard, to help future type-based refactoring.
         type R = Result<(), ErrorGuaranteed>;
 
-        let _: R = tcx.ensure_ok().check_type_wf(());
+        let _: R = tcx.ensure_result().check_type_wf(());
 
         for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
-            let _: R = tcx.ensure_ok().coherent_trait(trait_def_id);
+            let _: R = tcx.ensure_result().coherent_trait(trait_def_id);
         }
         // these queries are executed for side-effects (error reporting):
-        let _: R = tcx.ensure_ok().crate_inherent_impls_validity_check(());
-        let _: R = tcx.ensure_ok().crate_inherent_impls_overlap_check(());
-    });
-
-    tcx.sess.time("emit_ast_lowering_delayed_lints", || {
-        // sanity check in debug mode that all lints are really noticed
-        // and we really will emit them all in the loop right below.
-        //
-        // during ast lowering, when creating items, foreign items, trait items and impl items
-        // we store in them whether they have any lints in their owner node that should be
-        // picked up by `hir_crate_items`. However, theoretically code can run between that
-        // boolean being inserted into the item and the owner node being created.
-        // We don't want any new lints to be emitted there
-        // (though honestly, you have to really try to manage to do that but still),
-        // but this check is there to catch that.
-        #[cfg(debug_assertions)]
-        {
-            // iterate over all owners
-            for owner_id in tcx.hir_crate_items(()).owners() {
-                // if it has delayed lints
-                if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
-                    if !delayed_lints.lints.is_empty() {
-                        // assert that delayed_lint_items also picked up this item to have lints
-                        assert!(
-                            tcx.hir_crate_items(()).delayed_lint_items().any(|i| i == owner_id)
-                        );
-                    }
-                }
-            }
-        }
-
-        for owner_id in tcx.hir_crate_items(()).delayed_lint_items() {
-            if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
-                for lint in &delayed_lints.lints {
-                    emit_delayed_lint(lint, tcx);
-                }
-            }
-        }
+        let _: R = tcx.ensure_result().crate_inherent_impls_validity_check(());
+        let _: R = tcx.ensure_result().crate_inherent_impls_overlap_check(());
     });
 
     tcx.par_hir_body_owners(|item_def_id| {
@@ -231,7 +174,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
                 tcx.ensure_ok().eval_static_initializer(item_def_id);
                 check::maybe_check_static_with_link_section(tcx, item_def_id);
             }
-            DefKind::Const
+            DefKind::Const { .. }
                 if !tcx.generics_of(item_def_id).own_requires_monomorphization()
                     && !tcx.is_type_const(item_def_id) =>
             {
@@ -244,9 +187,13 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
             }
             _ => (),
         }
-        // Skip `AnonConst`s because we feed their `type_of`.
+        // Skip `AnonConst`s and type system `InlineConst`s because we feed their `type_of` in
+        // `feed_anon_const_type`.
         // Also skip items for which typeck forwards to parent typeck.
-        if !(matches!(def_kind, DefKind::AnonConst) || def_kind.is_typeck_child()) {
+        if !(def_kind == DefKind::AnonConst
+            && tcx.anon_const_kind(item_def_id) != ty::AnonConstKind::NonTypeSystemInline
+            || tcx.is_typeck_child(item_def_id.to_def_id()))
+        {
             tcx.ensure_ok().typeck(item_def_id);
         }
         // Ensure we generate the new `DefId` before finishing `check_crate`.
@@ -260,6 +207,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
         tcx.sess.time("dumping_rustc_attr_data", || {
             outlives::dump::inferred_outlives(tcx);
             variance::dump::variances(tcx);
+            collect::dump::generics(tcx);
             collect::dump::opaque_hidden_types(tcx);
             collect::dump::predicates_and_item_bounds(tcx);
             collect::dump::def_parents(tcx);

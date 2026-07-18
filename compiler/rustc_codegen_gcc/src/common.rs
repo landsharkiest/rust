@@ -5,9 +5,11 @@ use rustc_codegen_ssa::traits::{
     BaseTypeCodegenMethods, ConstCodegenMethods, MiscCodegenMethods, StaticCodegenMethods,
 };
 use rustc_middle::mir::Mutability;
-use rustc_middle::mir::interpret::{ConstAllocation, GlobalAlloc, PointerArithmetic, Scalar};
+use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar};
 use rustc_middle::ty::layout::LayoutOf;
+use rustc_session::PointerAuthSchema;
 
+use crate::consts::const_alloc_to_gcc;
 use crate::context::{CodegenCx, new_array_type};
 use crate::type_of::LayoutGccExt;
 
@@ -25,13 +27,13 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     }
 
     fn global_string(&self, string: &str) -> LValue<'gcc> {
-        // TODO(antoyo): handle non-null-terminated strings.
+        // FIXME(antoyo): handle non-null-terminated strings.
         let string = self.context.new_string_literal(string);
         let sym = self.generate_local_symbol_name("str");
         let global = self.declare_private_global(&sym, self.val_ty(string));
         global.global_set_initializer_rvalue(string);
         global
-        // TODO(antoyo): set linkage.
+        // FIXME(antoyo): set linkage.
     }
 
     pub fn const_bitcast(&self, value: RValue<'gcc>, typ: Type<'gcc>) -> RValue<'gcc> {
@@ -57,13 +59,19 @@ pub fn bytes_in_context<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, bytes: &[u8]) ->
     // or is it using a more efficient representation?
     match bytes.len() % 8 {
         0 => {
+            debug_assert_eq!(
+                bytes.len() % 8,
+                0,
+                "bytes length is not a multiple of 8, so bytes.as_chunks will have a remainder"
+            );
             let context = &cx.context;
             let byte_type = context.new_type::<u64>();
             let typ = new_array_type(context, None, byte_type, bytes.len() as u64 / 8);
             let elements: Vec<_> = bytes
-                .chunks_exact(8)
-                .map(|arr| {
-                    let arr: [u8; 8] = arr.try_into().unwrap();
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&arr| {
                     context.new_rvalue_from_long(
                         byte_type,
                         // Since we are representing arbitrary byte runs as integers, we need to follow the target
@@ -78,13 +86,19 @@ pub fn bytes_in_context<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, bytes: &[u8]) ->
             context.new_array_constructor(None, typ, &elements)
         }
         4 => {
+            debug_assert_eq!(
+                bytes.len() % 4,
+                0,
+                "bytes length is not a multiple of 4, so bytes.as_chunks will have a remainder"
+            );
             let context = &cx.context;
             let byte_type = context.new_type::<u32>();
             let typ = new_array_type(context, None, byte_type, bytes.len() as u64 / 4);
             let elements: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|arr| {
-                    let arr: [u8; 4] = arr.try_into().unwrap();
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&arr| {
                     context.new_rvalue_from_int(
                         byte_type,
                         match cx.sess().target.options.endian {
@@ -142,6 +156,10 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
 
     fn const_i32(&self, i: i32) -> RValue<'gcc> {
         self.const_int(self.type_i32(), i as i64)
+    }
+
+    fn const_i64(&self, i: i64) -> RValue<'gcc> {
+        self.const_int(self.type_i64(), i)
     }
 
     fn const_int(&self, typ: Type<'gcc>, int: i64) -> RValue<'gcc> {
@@ -203,7 +221,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
 
     fn const_struct(&self, values: &[RValue<'gcc>], packed: bool) -> RValue<'gcc> {
         let fields: Vec<_> = values.iter().map(|value| value.get_type()).collect();
-        // TODO(antoyo): cache the type? It's anonymous, so probably not.
+        // FIXME(antoyo): cache the type? It's anonymous, so probably not.
         let typ = self.type_struct(&fields, packed);
         let struct_type = typ.is_struct().expect("struct type");
         self.context.new_struct_constructor(None, struct_type.as_type(), None, values)
@@ -215,16 +233,22 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
     }
 
     fn const_to_opt_uint(&self, _v: RValue<'gcc>) -> Option<u64> {
-        // TODO(antoyo)
+        // FIXME(antoyo)
         None
     }
 
     fn const_to_opt_u128(&self, _v: RValue<'gcc>, _sign_ext: bool) -> Option<u128> {
-        // TODO(antoyo)
+        // FIXME(antoyo)
         None
     }
 
-    fn scalar_to_backend(&self, cv: Scalar, layout: abi::Scalar, ty: Type<'gcc>) -> RValue<'gcc> {
+    fn scalar_to_backend_with_pac(
+        &self,
+        cv: Scalar,
+        layout: abi::Scalar,
+        ty: Type<'gcc>,
+        _schema: Option<&PointerAuthSchema>,
+    ) -> RValue<'gcc> {
         let bitsize = if layout.is_bool() { 1 } else { layout.size(self).bits() };
         match cv {
             Scalar::Int(int) => {
@@ -235,10 +259,10 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                     // NOTE: since the intrinsic _xabort is called with a bitcast, which
                     // is non-const, but expects a constant, do a normal cast instead of a bitcast.
                     // FIXME(antoyo): fix bitcast to work in constant contexts.
-                    // TODO(antoyo): perhaps only use bitcast for pointers?
+                    // FIXME(antoyo): perhaps only use bitcast for pointers?
                     self.context.new_cast(None, value, ty)
                 } else {
-                    // TODO(bjorn3): assert size is correct
+                    // FIXME(bjorn3): assert size is correct
                     self.const_bitcast(value, ty)
                 }
             }
@@ -260,18 +284,20 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                             };
                         }
 
-                        let init = self.const_data_from_alloc(alloc);
-                        let alloc = alloc.inner();
-                        let value = match alloc.mutability {
-                            Mutability::Mut => self.static_addr_of_mut(init, alloc.align, None),
-                            _ => self.static_addr_of(init, alloc.align, None),
+                        let value = match alloc.inner().mutability {
+                            Mutability::Mut => self.static_addr_of_mut(
+                                const_alloc_to_gcc(self, alloc),
+                                alloc.inner().align,
+                                None,
+                            ),
+                            _ => self.static_addr_of(alloc, None),
                         };
                         if !self.sess().fewer_names() {
-                            // TODO(antoyo): set value name.
+                            // FIXME(antoyo): set value name.
                         }
                         value
                     }
-                    GlobalAlloc::Function { instance, .. } => self.get_fn_addr(instance),
+                    GlobalAlloc::Function { instance, .. } => self.get_fn_addr(instance, None),
                     GlobalAlloc::VTable(ty, dyn_ty) => {
                         let alloc = self
                             .tcx
@@ -282,8 +308,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                                 }),
                             )))
                             .unwrap_memory();
-                        let init = self.const_data_from_alloc(alloc);
-                        self.static_addr_of(init, alloc.inner().align, None)
+                        self.static_addr_of(alloc, None)
                     }
                     GlobalAlloc::TypeId { .. } => {
                         let val = self.const_usize(offset.bytes());
@@ -309,22 +334,6 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                 }
             }
         }
-    }
-
-    fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
-        // We ignore the alignment for the purpose of deduping RValues
-        // The alignment is not handled / used in any way by `const_alloc_to_gcc`,
-        // so it is OK to overwrite it here.
-        let mut mock_alloc = alloc.inner().clone();
-        mock_alloc.align = rustc_abi::Align::MAX;
-        // Check if the rvalue is already in the cache - if so, just return it directly.
-        if let Some(res) = self.const_cache.borrow().get(&mock_alloc) {
-            return *res;
-        }
-        // Rvalue not in the cache - convert and add it.
-        let res = crate::consts::const_alloc_to_gcc_uncached(self, alloc);
-        self.const_cache.borrow_mut().insert(mock_alloc, res);
-        res
     }
 
     fn const_ptr_byte_offset(&self, base_addr: Self::Value, offset: abi::Size) -> Self::Value {

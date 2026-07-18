@@ -76,6 +76,21 @@ pub(crate) fn CreateAttrStringValue<'ll>(
         )
     }
 }
+pub(crate) fn CreateAttrStringValueFromCStr<'ll>(
+    llcx: &'ll Context,
+    attr: &std::ffi::CStr,
+    value: &std::ffi::CStr,
+) -> &'ll Attribute {
+    unsafe {
+        LLVMCreateStringAttribute(
+            llcx,
+            (*attr).as_ptr(),
+            (*attr).to_bytes().len() as c_uint,
+            (*value).as_ptr(),
+            (*value).to_bytes().len() as c_uint,
+        )
+    }
+}
 
 pub(crate) fn CreateAttrString<'ll>(llcx: &'ll Context, attr: &str) -> &'ll Attribute {
     unsafe {
@@ -284,6 +299,10 @@ pub(crate) fn set_comdat(llmod: &Module, llglobal: &Value, name: &CStr) {
     }
 }
 
+pub(crate) fn count_params(llfn: &Value) -> c_uint {
+    LLVMCountParams(llfn)
+}
+
 /// Safe wrapper around `LLVMGetParam`, because segfaults are no fun.
 pub(crate) fn get_param(llfn: &Value, index: c_uint) -> &Value {
     unsafe {
@@ -317,6 +336,14 @@ impl Intrinsic {
     pub(crate) fn lookup(name: &[u8]) -> Option<Self> {
         let id = unsafe { LLVMLookupIntrinsicID(name.as_c_char_ptr(), name.len()) };
         NonZero::new(id).map(|id| Self { id })
+    }
+
+    pub(crate) fn is_overloaded(self) -> bool {
+        unsafe { LLVMIntrinsicIsOverloaded(self.id).is_true() }
+    }
+
+    pub(crate) fn is_target_specific(self) -> bool {
+        unsafe { LLVMRustIsTargetIntrinsic(self.id) }
     }
 
     pub(crate) fn get_declaration<'ll>(
@@ -462,4 +489,20 @@ pub(crate) fn add_alias<'ll>(
     name: &CStr,
 ) -> &'ll Value {
     unsafe { LLVMAddAlias2(module, ty, address_space.0, aliasee, name.as_ptr()) }
+}
+
+/// Safe wrapper for `LLVMRustConstPtrAuth`.
+pub(crate) fn const_ptr_auth<'ll>(
+    ptr: &'ll Value,
+    key: u32,
+    disc: u64,
+    addr_diversity: Option<&'ll Value>,
+) -> &'ll Value {
+    unsafe {
+        let addr_div_ptr = addr_diversity.map_or(std::ptr::null(), |v| v as *const Value);
+        let deactivation_symbol = std::ptr::null();
+        let result =
+            LLVMRustConstPtrAuth(ptr as *const Value, key, disc, addr_div_ptr, deactivation_symbol);
+        &*result
+    }
 }

@@ -1,7 +1,7 @@
 //! Check that a body annotated with `#[rustc_force_inline]` will not fail to inline based on its
 //! definition alone (irrespective of any specific caller).
 
-use rustc_hir::attrs::{AttributeKind, InlineAttr};
+use rustc_hir::attrs::InlineAttr;
 use rustc_hir::def_id::DefId;
 use rustc_hir::find_attr;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -26,7 +26,7 @@ impl<'tcx> MirLint<'tcx> for CheckForceInline {
         if let Err(reason) =
             is_inline_valid_on_fn(tcx, def_id).and_then(|_| is_inline_valid_on_body(tcx, body))
         {
-            tcx.dcx().emit_err(crate::errors::InvalidForceInline {
+            tcx.dcx().emit_err(crate::diagnostics::InvalidForceInline {
                 attr_span,
                 callee_span: tcx.def_span(def_id),
                 callee: tcx.def_path_str(def_id),
@@ -42,13 +42,13 @@ pub(super) fn is_inline_valid_on_fn<'tcx>(
 ) -> Result<(), &'static str> {
     let codegen_attrs = tcx.codegen_fn_attrs(def_id);
 
-    if find_attr!(tcx.get_all_attrs(def_id), AttributeKind::RustcNoMirInline) {
+    if find_attr!(tcx, def_id, RustcNoMirInline) {
         return Err("#[rustc_no_mir_inline]");
     }
 
     let ty = tcx.type_of(def_id);
-    if match ty.instantiate_identity().kind() {
-        ty::FnDef(..) => tcx.fn_sig(def_id).instantiate_identity().c_variadic(),
+    if match ty.instantiate_identity().skip_norm_wip().kind() {
+        ty::FnDef(..) => tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip().c_variadic(),
         ty::Closure(_, args) => args.as_closure().sig().c_variadic(),
         _ => false,
     } {
@@ -59,12 +59,12 @@ pub(super) fn is_inline_valid_on_fn<'tcx>(
         return Err("cold");
     }
 
-    // Intrinsic fallback bodies are automatically made cross-crate inlineable,
-    // but at this stage we don't know whether codegen knows the intrinsic,
-    // so just conservatively don't inline it. This also ensures that we do not
-    // accidentally inline the body of an intrinsic that *must* be overridden.
-    if find_attr!(tcx.get_all_attrs(def_id), AttributeKind::RustcIntrinsic) {
-        return Err("callee is an intrinsic");
+    // Intrinsics without fallback body cannot be inlined. The logic for which intrinsics *with*
+    // body can be inlined is in the inlining pass.
+    if let Some(intrinsic) = tcx.intrinsic(def_id)
+        && intrinsic.must_be_overridden
+    {
+        return Err("callee is an intrinsic without fallback body");
     }
 
     Ok(())

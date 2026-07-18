@@ -6,6 +6,7 @@ use rustc_abi::Align;
 use rustc_ast::ast::{Path, join_path_idents};
 use rustc_ast::attr::data_structures::CfgEntry;
 use rustc_ast::attr::version::RustcVersion;
+use rustc_ast::expand::autodiff_attrs::{DiffActivity, DiffMode};
 use rustc_ast::token::{CommentKind, DocFragmentKind};
 use rustc_ast::{AttrId, AttrStyle, IntTy, UintTy};
 use rustc_ast_pretty::pp::Printer;
@@ -80,7 +81,7 @@ impl<T: PrintAttribute> PrintAttribute for ThinVec<T> {
         p.word("]");
     }
 }
-impl<T: PrintAttribute> PrintAttribute for FxIndexMap<T, Span> {
+impl<T: PrintAttribute, T2: PrintAttribute> PrintAttribute for FxIndexMap<T, T2> {
     fn should_render(&self) -> bool {
         self.is_empty() || self[0].should_render()
     }
@@ -191,7 +192,7 @@ macro_rules! print_tup {
 
 print_tup!(A B C D E F G H);
 print_skip!(Span, (), ErrorGuaranteed, AttrId);
-print_disp!(u8, u16, u128, usize, bool, NonZero<u32>, Limit);
+print_disp!(u8, u16, u32, u128, usize, bool, NonZero<u32>, Limit);
 print_debug!(
     Symbol,
     Ident,
@@ -206,4 +207,6 @@ print_debug!(
     DefId,
     RustcVersion,
     CfgEntry,
+    DiffActivity,
+    DiffMode,
 );

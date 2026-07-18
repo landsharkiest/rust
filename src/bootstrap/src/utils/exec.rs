@@ -7,6 +7,7 @@
 //! relevant to command execution in the bootstrap process. This includes settings such as
 //! dry-run mode, verbosity level, and failure behavior.
 
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
@@ -22,10 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use build_helper::drop_bomb::DropBomb;
-use build_helper::exit;
 
 use crate::core::config::DryRun;
-use crate::{PathBuf, t};
+use crate::{PathBuf, exit, t};
 
 /// What should be done when the command fails.
 #[derive(Debug, Copy, Clone)]
@@ -929,6 +929,16 @@ Executed at: {executed_at}"#,
             }
             if stderr.captures() {
                 writeln!(error_message, "\n--- STDERR vvv\n{}", output.stderr().trim()).unwrap();
+            }
+            let backtrace = if exec_ctx.verbosity > 1 {
+                Backtrace::force_capture()
+            } else if matches!(command.failure_behavior, BehaviorOnFailure::Ignore) {
+                Backtrace::disabled()
+            } else {
+                Backtrace::capture()
+            };
+            if matches!(backtrace.status(), BacktraceStatus::Captured) {
+                writeln!(error_message, "\n--- BACKTRACE vvv\n{backtrace}").unwrap();
             }
 
             match command.failure_behavior {

@@ -1,9 +1,9 @@
 //! This module resolves `mod foo;` declaration to file.
 use arrayvec::ArrayVec;
-use base_db::{AnchoredPath, Crate};
+use base_db::{AnchoredPath, SourceDatabase};
 use hir_expand::{EditionedFileId, name::Name};
 
-use crate::{HirFileId, db::DefDatabase};
+use crate::HirFileId;
 
 const MOD_DEPTH_LIMIT: usize = 32;
 
@@ -58,11 +58,10 @@ impl ModDir {
 
     pub(super) fn resolve_declaration(
         &self,
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         file_id: HirFileId,
         name: &Name,
         attr_path: Option<&str>,
-        krate: Crate,
     ) -> Result<(EditionedFileId, bool, ModDir), Box<[String]>> {
         let name = name.as_str();
 
@@ -92,7 +91,7 @@ impl ModDir {
                 if let Some(mod_dir) = self.child(dir_path, !root_dir_owner) {
                     return Ok((
                         // FIXME: Edition, is this rightr?
-                        EditionedFileId::new(db, file_id, orig_file_id.edition(db), krate),
+                        EditionedFileId::new(db, file_id, orig_file_id.edition(db)),
                         is_mod_rs,
                         mod_dir,
                     ));

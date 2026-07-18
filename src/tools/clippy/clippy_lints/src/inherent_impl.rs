@@ -3,7 +3,7 @@ use clippy_config::types::InherentImplLintScope;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::{fulfill_or_allowed, is_cfg_test, is_in_cfg_test};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::{LocalDefId, LocalModDefId};
+use rustc_hir::def_id::{LocalDefId, LocalModId};
 use rustc_hir::{Item, ItemKind, Node};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
@@ -63,7 +63,7 @@ impl MultipleInherentImpl {
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 enum Criterion {
-    Module(LocalModDefId),
+    Module(LocalModId),
     File(FileName),
     Crate,
 }
@@ -90,7 +90,7 @@ impl<'tcx> LateLintPass<'tcx> for MultipleInherentImpl {
             }
 
             for impl_id in impl_ids.iter().map(|id| id.expect_local()) {
-                let impl_ty = cx.tcx.type_of(impl_id).instantiate_identity();
+                let impl_ty = cx.tcx.type_of(impl_id).instantiate_identity().skip_norm_wip();
                 let hir_id = cx.tcx.local_def_id_to_hir_id(impl_id);
                 let criterion = match self.scope {
                     InherentImplLintScope::Module => Criterion::Module(cx.tcx.parent_module(hir_id)),

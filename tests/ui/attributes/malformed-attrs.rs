@@ -2,7 +2,6 @@
 // We enable a bunch of features to not get feature-gate errs in this test.
 #![deny(invalid_doc_attributes)]
 #![feature(rustc_attrs)]
-#![feature(rustc_allow_const_fn_unstable)]
 #![feature(allow_internal_unstable)]
 // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
 #![feature(fn_align)]
@@ -46,7 +45,6 @@
 //~| ERROR attribute cannot be used on
 #[repr]
 //~^ ERROR malformed
-//~| ERROR is not supported on functions
 #[rustc_as_ptr = 5]
 //~^ ERROR malformed
 #[inline = 5]
@@ -55,6 +53,10 @@
 #[rustc_align]
 //~^ ERROR malformed
 #[optimize]
+//~^ ERROR malformed
+#[optimize(none, none)]
+//~^ ERROR malformed
+#[optimize(none, speed)]
 //~^ ERROR malformed
 #[cold = 1]
 //~^ ERROR malformed
@@ -82,7 +84,7 @@
 //~^ ERROR malformed
 #[link]
 //~^ ERROR malformed
-//~| WARN attribute should be applied to an `extern` block with non-Rust ABI
+//~| WARN attribute cannot be used on
 //~| WARN previously accepted
 #[link_name]
 //~^ ERROR malformed
@@ -130,10 +132,6 @@ fn test2() { }
 //~| ERROR the `#[proc_macro_derive]` attribute is only usable with crates of the `proc-macro` crate type
 pub fn test3() {}
 
-#[rustc_layout_scalar_valid_range_start]
-//~^ ERROR malformed
-#[rustc_layout_scalar_valid_range_end]
-//~^ ERROR malformed
 #[must_not_suspend()]
 //~^ ERROR malformed
 #[cfi_encoding = ""]
@@ -141,7 +139,7 @@ pub fn test3() {}
 struct Test;
 
 #[diagnostic::on_unimplemented]
-//~^ WARN missing options for `on_unimplemented` attribute
+//~^ WARN missing options for `diagnostic::on_unimplemented` attribute
 #[diagnostic::on_unimplemented = 1]
 //~^ WARN malformed
 trait Hey {

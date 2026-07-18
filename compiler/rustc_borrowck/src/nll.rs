@@ -7,7 +7,6 @@ use std::str::FromStr;
 
 use polonius_engine::{Algorithm, AllFacts, Output};
 use rustc_data_structures::frozen::Frozen;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::find_attr;
 use rustc_index::IndexSlice;
 use rustc_middle::mir::pretty::PrettyPrintMirOptions;
@@ -112,7 +111,7 @@ pub(crate) fn compute_closure_requirements_modulo_opaques<'tcx>(
 ///
 /// This may result in errors being reported.
 pub(crate) fn compute_regions<'tcx>(
-    root_cx: &mut BorrowCheckRootCtxt<'tcx>,
+    root_cx: &BorrowCheckRootCtxt<'tcx>,
     infcx: &BorrowckInferCtxt<'tcx>,
     body: &Body<'tcx>,
     location_table: &PoloniusLocationTable,
@@ -296,7 +295,7 @@ pub(super) fn dump_annotation<'tcx, 'infcx>(
 ) {
     let tcx = infcx.tcx;
     let base_def_id = tcx.typeck_root_def_id(body.source.def_id());
-    if !find_attr!(tcx.get_all_attrs(base_def_id), AttributeKind::RustcRegions) {
+    if !find_attr!(tcx, base_def_id, RustcRegions) {
         return;
     }
 

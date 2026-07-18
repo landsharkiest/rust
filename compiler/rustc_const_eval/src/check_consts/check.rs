@@ -1,13 +1,11 @@
 //! The `Visitor` responsible for actually checking a `mir::Body` for invalid operations.
 
 use std::borrow::Cow;
-use std::mem;
 use std::num::NonZero;
 use std::ops::Deref;
+use std::{assert_matches, mem};
 
-use rustc_data_structures::assert_matches;
 use rustc_errors::{Diag, ErrorGuaranteed};
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, LangItem, find_attr};
@@ -31,7 +29,7 @@ use super::qualifs::{self, HasMutInterior, NeedsDrop, NeedsNonConstDrop};
 use super::resolver::FlowSensitiveAnalysis;
 use super::{ConstCx, Qualif};
 use crate::check_consts::is_fn_or_trait_safe_to_expose_on_stable;
-use crate::errors;
+use crate::diagnostics;
 
 type QualifResults<'mir, 'tcx, Q> =
     rustc_mir_dataflow::ResultsCursor<'mir, 'tcx, FlowSensitiveAnalysis<'mir, 'tcx, Q>>;
@@ -216,7 +214,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             return;
         }
 
-        if !find_attr!(tcx.get_all_attrs(def_id), AttributeKind::RustcDoNotConstCheck) {
+        if !find_attr!(tcx, def_id, RustcDoNotConstCheck) {
             self.visit_body(body);
         }
 
@@ -335,7 +333,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             self.tcx.dcx().span_bug(span, "tls access is checked in `Rvalue::ThreadLocalRef`");
         }
         if let Some(def_id) = def_id.as_local()
-            && let Err(guar) = self.tcx.ensure_ok().check_well_formed(hir::OwnerId { def_id })
+            && let Err(guar) = self.tcx.ensure_result().check_well_formed(hir::OwnerId { def_id })
         {
             self.error_emitted = Some(guar);
         }
@@ -401,8 +399,9 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
                 ty::BoundConstness::Const
             }
         };
-        let const_conditions =
-            ocx.normalize(&ObligationCause::misc(call_span, body_id), param_env, const_conditions);
+        let const_conditions = const_conditions.into_iter().map(|(c, s)| {
+            (ocx.normalize(&ObligationCause::misc(call_span, body_id), param_env, c), s)
+        });
         ocx.register_obligations(const_conditions.into_iter().map(|(trait_ref, span)| {
             Obligation::new(
                 tcx,
@@ -476,7 +475,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
                 if self.enforce_recursive_const_stability()
                     && !is_fn_or_trait_safe_to_expose_on_stable(self.tcx, def_id)
                 {
-                    self.dcx().emit_err(errors::UnmarkedConstItemExposed {
+                    self.dcx().emit_err(diagnostics::UnmarkedConstItemExposed {
                         span: self.span,
                         def_path: self.tcx.def_path_str(def_id),
                     });
@@ -571,14 +570,14 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
         match rvalue {
             Rvalue::ThreadLocalRef(_) => self.check_op(ops::ThreadLocalAccess),
 
-            Rvalue::Use(_)
+            Rvalue::Use(..)
             | Rvalue::CopyForDeref(..)
             | Rvalue::Repeat(..)
             | Rvalue::Discriminant(..) => {}
 
             Rvalue::Aggregate(kind, ..) => {
                 if let AggregateKind::Coroutine(def_id, ..) = kind.as_ref()
-                    && let Some(coroutine_kind) = self.tcx.coroutine_kind(def_id)
+                    && let Some(coroutine_kind) = self.tcx.coroutine_kind(*def_id)
                 {
                     self.check_op(ops::Coroutine(coroutine_kind));
                 }
@@ -609,6 +608,10 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 if borrowed_place_has_mut_interior && self.place_may_escape(place) {
                     self.check_op(ops::EscapingCellBorrow);
                 }
+            }
+
+            Rvalue::Reborrow(..) => {
+                // FIXME(reborrow): figure out if this is relevant at all.
             }
 
             Rvalue::RawPtr(RawPtrKind::FakeForPtrMetadata, place) => {
@@ -646,8 +649,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
             Rvalue::Cast(_, _, _) => {}
 
-            Rvalue::ShallowInitBox(_, _) => {}
-
             Rvalue::UnaryOp(op, operand) => {
                 let ty = operand.ty(self.body, self.tcx);
                 match op {
@@ -668,7 +669,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 }
             }
 
-            Rvalue::BinaryOp(op, box (lhs, rhs)) => {
+            Rvalue::BinaryOp(op, (lhs, rhs)) => {
                 let lhs_ty = lhs.ty(self.body, self.tcx);
                 let rhs_ty = rhs.ty(self.body, self.tcx);
 
@@ -728,7 +729,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | StatementKind::FakeRead(..)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
-            | StatementKind::Retag { .. }
             | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
@@ -757,7 +757,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 let fn_ty = func.ty(body, tcx);
 
                 let (callee, fn_args) = match *fn_ty.kind() {
-                    ty::FnDef(def_id, fn_args) => (def_id, fn_args),
+                    ty::FnDef(def_id, fn_args) => (def_id, fn_args.no_bound_vars().unwrap()),
 
                     ty::FnPtr(..) => {
                         self.check_op(ops::FnCallIndirect);
@@ -779,7 +779,8 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     // to do different checks than usual.
 
                     trace!("attempting to call a trait method");
-                    let is_const = tcx.constness(callee) == hir::Constness::Const;
+                    let is_const =
+                        matches!(tcx.constness(callee), hir::Constness::Const { always: false });
 
                     // Only consider a trait to be const if the const conditions hold.
                     // Otherwise, it's really misleading to call something "conditionally"
@@ -850,13 +851,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     return;
                 }
 
-                // This can be called on stable via the `vec!` macro.
-                if tcx.is_lang_item(callee, LangItem::ExchangeMalloc) {
-                    self.check_op(ops::HeapAllocation);
-                    // Allow this call, skip all the checks below.
-                    return;
-                }
-
                 // Intrinsics are language primitives, not regular calls, so treat them separately.
                 if let Some(intrinsic) = tcx.intrinsic(callee) {
                     if !tcx.is_const_fn(callee) {
@@ -880,7 +874,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                             // regular stability, and regular stability is checked separately.
                             // However, we *do* have to worry about *recursive* const stability.
                             if !is_const_stable && self.enforce_recursive_const_stability() {
-                                self.dcx().emit_err(errors::UnmarkedIntrinsicExposed {
+                                self.dcx().emit_err(diagnostics::UnmarkedIntrinsicExposed {
                                     span: self.span,
                                     def_path: self.tcx.def_path_str(callee),
                                 });
@@ -994,7 +988,7 @@ fn emit_unstable_in_stable_exposed_error(
 ) -> ErrorGuaranteed {
     let attr_span = ccx.tcx.def_span(ccx.def_id()).shrink_to_lo();
 
-    ccx.dcx().emit_err(errors::UnstableInStableExposed {
+    ccx.dcx().emit_err(diagnostics::UnstableInStableExposed {
         gate: gate.to_string(),
         span,
         attr_span,

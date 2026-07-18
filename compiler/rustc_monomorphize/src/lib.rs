@@ -1,6 +1,5 @@
 // tidy-alphabetical-start
 #![feature(file_buffered)]
-#![feature(if_let_guard)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(once_cell_get_mut)]
 // tidy-alphabetical-end
@@ -14,7 +13,7 @@ use rustc_middle::{bug, traits};
 use rustc_span::ErrorGuaranteed;
 
 mod collector;
-mod errors;
+mod diagnostics;
 mod graph_checks;
 mod mono_checks;
 mod partitioning;
@@ -37,7 +36,7 @@ fn custom_coerce_unsize_info<'tcx>(
         Ok(traits::ImplSource::UserDefined(traits::ImplSourceUserDefinedData {
             impl_def_id,
             ..
-        })) => Ok(tcx.coerce_unsized_info(impl_def_id)?.custom_kind.unwrap()),
+        })) => Ok(tcx.coerce_unsized_info(*impl_def_id)?.custom_kind.unwrap()),
         impl_source => {
             bug!(
                 "invalid `CoerceUnsized` from {source_ty} to {target_ty}: impl_source: {:?}",

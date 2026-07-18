@@ -1,9 +1,8 @@
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_hir::find_attr;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 
 use crate::error::StrictCoherenceNeedsNegativeCoherence;
 use crate::ty::fast_reject::SimplifiedType;
@@ -24,7 +23,7 @@ use crate::ty::{self, TyCtxt, TypeVisitableExt};
 ///   parents of a given specializing impl, which is needed for extracting
 ///   default items amongst other things. In the simple "chain" rule, every impl
 ///   has at most one parent.
-#[derive(TyEncodable, TyDecodable, HashStable, Debug)]
+#[derive(TyEncodable, TyDecodable, StableHash, Debug)]
 pub struct Graph {
     /// All impls have a parent; the "root" impls have as their parent the `def_id`
     /// of the trait.
@@ -49,7 +48,7 @@ impl Graph {
 
 /// What kind of overlap check are we doing -- this exists just for testing and feature-gating
 /// purposes.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable, Debug, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash, Debug, TyEncodable, TyDecodable)]
 pub enum OverlapMode {
     /// The 1.0 rules (either types fail to unify, or where clauses are not implemented for crate-local types)
     Stable,
@@ -62,7 +61,7 @@ pub enum OverlapMode {
 impl OverlapMode {
     pub fn get(tcx: TyCtxt<'_>, trait_id: DefId) -> OverlapMode {
         let with_negative_coherence = tcx.features().with_negative_coherence();
-        let strict_coherence = find_attr!(tcx.get_all_attrs(trait_id), AttributeKind::RustcStrictCoherence(span) => *span);
+        let strict_coherence = find_attr!(tcx, trait_id, RustcStrictCoherence(span) => *span);
 
         if with_negative_coherence {
             if strict_coherence.is_some() { OverlapMode::Strict } else { OverlapMode::WithNegative }
@@ -88,7 +87,7 @@ impl OverlapMode {
 
 /// Children of a given impl, grouped into blanket/non-blanket varieties as is
 /// done in `TraitDef`.
-#[derive(Default, TyEncodable, TyDecodable, Debug, HashStable)]
+#[derive(Default, TyEncodable, TyDecodable, Debug, StableHash)]
 pub struct Children {
     // Impls of a trait (or specializations of a given impl). To allow for
     // quicker lookup, the impls are indexed by a simplified version of their
@@ -176,7 +175,7 @@ pub struct LeafDef {
     /// The node in the specialization graph containing the definition of `item`.
     pub defining_node: Node,
 
-    /// The "top-most" (ie. least specialized) specialization graph node that finalized the
+    /// The "top-most" (i.e. least specialized) specialization graph node that finalized the
     /// definition of `item`.
     ///
     /// Example:
@@ -211,7 +210,7 @@ impl LeafDef {
 }
 
 impl<'tcx> Ancestors<'tcx> {
-    /// Finds the bottom-most (ie. most specialized) definition of an associated
+    /// Finds the bottom-most (i.e. most specialized) definition of an associated
     /// item.
     pub fn leaf_def(mut self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<LeafDef> {
         let mut finalizing_node = None;
@@ -249,7 +248,9 @@ pub fn ancestors(
 ) -> Result<Ancestors<'_>, ErrorGuaranteed> {
     let specialization_graph = tcx.specialization_graph_of(trait_def_id)?;
 
-    if let Err(reported) = tcx.type_of(start_from_impl).instantiate_identity().error_reported() {
+    if let Err(reported) =
+        tcx.type_of(start_from_impl).instantiate_identity().skip_normalization().error_reported()
+    {
         Err(reported)
     } else {
         Ok(Ancestors {

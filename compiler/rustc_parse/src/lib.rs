@@ -1,12 +1,10 @@
 //! The main parser interface.
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(assert_matches))]
 #![cfg_attr(test, feature(iter_order_by))]
-#![feature(box_patterns)]
 #![feature(debug_closure_helpers)]
 #![feature(default_field_values)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(iter_intersperse)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
@@ -22,8 +20,9 @@ use rustc_ast_pretty::pprust;
 use rustc_errors::{Diag, EmissionGuarantee, FatalError, PResult, pluralize};
 pub use rustc_lexer::UNICODE_VERSION;
 use rustc_session::parse::ParseSess;
+use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{FileName, SourceFile, Span};
+use rustc_span::{FileName, SourceFile, Span, Symbol};
 
 pub const MACRO_ARGUMENTS: Option<&str> = Some("macro arguments");
 
@@ -35,7 +34,7 @@ use crate::lexer::StripTokens;
 
 pub mod lexer;
 
-mod errors;
+mod diagnostics;
 
 // Make sure that the Unicode version of the dependencies is the same.
 const _: () = {
@@ -107,6 +106,8 @@ pub fn new_parser_from_source_str(
 /// dropped.
 ///
 /// If a span is given, that is used on an error as the source of the problem.
+///
+/// Error messages are tailored to the specific error kind.
 pub fn new_parser_from_file<'a>(
     psess: &'a ParseSess,
     path: &Path,
@@ -115,24 +116,51 @@ pub fn new_parser_from_file<'a>(
 ) -> Result<Parser<'a>, Vec<Diag<'a>>> {
     let sm = psess.source_map();
     let source_file = sm.load_file(path).unwrap_or_else(|e| {
-        let msg = format!("couldn't read `{}`: {}", path.display(), e);
+        use std::io::ErrorKind;
+
+        let msg = match e.kind() {
+            ErrorKind::NotFound => format!("couldn't find file `{}`", path.display()),
+            ErrorKind::PermissionDenied => {
+                format!("permission denied when opening file `{}`", path.display())
+            }
+            ErrorKind::IsADirectory => format!("`{}` is a directory", path.display()),
+            _ => format!("couldn't read `{}`: {}", path.display(), e),
+        };
+
         let mut err = psess.dcx().struct_fatal(msg);
+
+        if e.kind() == ErrorKind::NotFound {
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                let parent = match path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    let candidates: Vec<Symbol> = entries
+                        .flatten()
+                        .filter_map(|entry| entry.file_name().to_str().map(Symbol::intern))
+                        .collect();
+                    let lookup = Symbol::intern(file_name);
+                    if let Some(suggestion) = find_best_match_for_name(&candidates, lookup, None) {
+                        let suggested_path = if parent == Path::new(".") {
+                            suggestion.as_str().to_string()
+                        } else {
+                            parent.join(suggestion.as_str()).display().to_string()
+                        };
+                        err.help(format!("you might have meant to open `{}`", suggested_path));
+                    }
+                }
+            }
+        }
         if let Ok(contents) = std::fs::read(path)
-            && let Err(utf8err) = String::from_utf8(contents.clone())
+            && let Err(utf8err) = std::str::from_utf8(&contents)
         {
-            utf8_error(
-                sm,
-                &path.display().to_string(),
-                sp,
-                &mut err,
-                utf8err.utf8_error(),
-                &contents,
-            );
+            utf8_error(sm, &path.display().to_string(), sp, &mut err, utf8err, &contents);
         }
         if let Some(sp) = sp {
             err.span(sp);
         }
-        err.emit();
+        err.emit()
     });
     new_parser_from_source_file(psess, source_file, strip_tokens)
 }
@@ -262,6 +290,15 @@ pub fn parse_in<'a, T>(
 
 pub fn fake_token_stream_for_item(psess: &ParseSess, item: &ast::Item) -> TokenStream {
     let source = pprust::item_to_string(item);
+    let filename = FileName::macro_expansion_source_code(&source);
+    unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
+}
+
+pub fn fake_token_stream_for_foreign_item(
+    psess: &ParseSess,
+    item: &ast::ForeignItem,
+) -> TokenStream {
+    let source = pprust::foreign_item_to_string(item);
     let filename = FileName::macro_expansion_source_code(&source);
     unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
 }

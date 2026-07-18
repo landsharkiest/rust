@@ -4,30 +4,25 @@
 //! It is an unfortunate result of how the proc-macro API works that we need to look into the
 //! concrete representation of the spans, and as such, RustRover cannot make use of this unless they
 //! change their representation to be compatible with rust-analyzer's.
-use std::{
-    collections::{HashMap, HashSet},
-    ops::{Bound, Range},
-};
+use std::ops::{Bound, Range};
 
 use intern::Symbol;
 use rustc_proc_macro::bridge::server;
-use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
+use span::{ErasedFileAstId, Span, TextRange, TextSize};
 
 use crate::{
-    ProcMacroClientHandle,
+    ProcMacroClientHandle, TrackedEnv,
     bridge::{Diagnostic, ExpnGlobals, Literal, TokenTree},
     server_impl::literal_from_str,
 };
 
 pub struct RaSpanServer<'a> {
-    // FIXME: Report this back to the caller to track as dependencies
-    pub tracked_env_vars: HashMap<Box<str>, Option<Box<str>>>,
-    // FIXME: Report this back to the caller to track as dependencies
-    pub tracked_paths: HashSet<Box<str>>,
+    pub tracked_env: &'a mut TrackedEnv,
     pub call_site: Span,
     pub def_site: Span,
     pub mixed_site: Span,
     pub callback: Option<ProcMacroClientHandle<'a>>,
+    pub fixup_id: ErasedFileAstId,
 }
 
 impl server::Server for RaSpanServer<'_> {
@@ -56,14 +51,15 @@ impl server::Server for RaSpanServer<'_> {
     }
 
     fn track_env_var(&mut self, var: &str, value: Option<&str>) {
-        self.tracked_env_vars.insert(var.into(), value.map(Into::into));
+        self.tracked_env.env_vars.insert(var.into(), value.map(Into::into));
     }
     fn track_path(&mut self, path: &str) {
-        self.tracked_paths.insert(path.into());
+        self.tracked_env.paths.insert(path.into());
     }
 
-    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, ()> {
+    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, String> {
         literal_from_str(s, self.call_site)
+            .map_err(|()| "cannot parse string into literal".to_string())
     }
 
     fn emit_diagnostic(&mut self, _: Diagnostic<Self::Span>) {
@@ -81,14 +77,9 @@ impl server::Server for RaSpanServer<'_> {
     fn ts_is_empty(&mut self, stream: &Self::TokenStream) -> bool {
         stream.is_empty()
     }
-    fn ts_from_str(&mut self, src: &str) -> Self::TokenStream {
-        Self::TokenStream::from_str(src, self.call_site).unwrap_or_else(|e| {
-            Self::TokenStream::from_str(
-                &format!("compile_error!(\"failed to parse str to token stream: {e}\")"),
-                self.call_site,
-            )
-            .unwrap()
-        })
+    fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
+        Self::TokenStream::from_str(src, self.call_site)
+            .map_err(|e| format!("failed to parse str to token stream: {e}"))
     }
     fn ts_to_string(&mut self, stream: &Self::TokenStream) -> String {
         stream.to_string()
@@ -168,12 +159,16 @@ impl server::Server for RaSpanServer<'_> {
         self.callback.as_mut()?.source_text(span)
     }
 
-    fn span_parent(&mut self, _span: Self::Span) -> Option<Self::Span> {
-        // FIXME requires db, looks up the parent call site
+    fn span_parent(&mut self, span: Self::Span) -> Option<Self::Span> {
+        if let Some(ref mut callback) = self.callback {
+            return callback.span_parent(span);
+        }
         None
     }
     fn span_source(&mut self, span: Self::Span) -> Self::Span {
-        // FIXME requires db, returns the top level call site
+        if let Some(ref mut callback) = self.callback {
+            return callback.span_source(span);
+        }
         span
     }
     fn span_byte_range(&mut self, span: Self::Span) -> Range<usize> {
@@ -185,24 +180,18 @@ impl server::Server for RaSpanServer<'_> {
     fn span_join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
         // We can't modify the span range for fixup spans, those are meaningful to fixup, so just
         // prefer the non-fixup span.
-        if first.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
+        if first.anchor.ast_id == self.fixup_id {
             return Some(second);
         }
-        if second.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
+        if second.anchor.ast_id == self.fixup_id {
             return Some(first);
         }
-        // FIXME: Once we can talk back to the client, implement a "long join" request for anchors
-        // that differ in [AstId]s as joining those spans requires resolving the AstIds.
         if first.anchor != second.anchor {
-            return None;
+            return self.callback.as_mut()?.span_join(first, second);
         }
-        // Differing context, we can't merge these so prefer the one that's root
+        // Differing context, we can't merge these
         if first.ctx != second.ctx {
-            if first.ctx.is_root() {
-                return Some(second);
-            } else if second.ctx.is_root() {
-                return Some(first);
-            }
+            return Some(first);
         }
         Some(Span {
             range: first.range.cover(second.range),
@@ -217,7 +206,7 @@ impl server::Server for RaSpanServer<'_> {
         end: Bound<usize>,
     ) -> Option<Self::Span> {
         // We can't modify the span range for fixup spans, those are meaningful to fixup.
-        if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
+        if span.anchor.ast_id == self.fixup_id {
             return Some(span);
         }
         let length = span.range.len().into();
@@ -260,7 +249,7 @@ impl server::Server for RaSpanServer<'_> {
 
     fn span_end(&mut self, span: Self::Span) -> Self::Span {
         // We can't modify the span range for fixup spans, those are meaningful to fixup.
-        if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
+        if span.anchor.ast_id == self.fixup_id {
             return span;
         }
         Span { range: TextRange::empty(span.range.end()), ..span }
@@ -268,7 +257,7 @@ impl server::Server for RaSpanServer<'_> {
 
     fn span_start(&mut self, span: Self::Span) -> Self::Span {
         // We can't modify the span range for fixup spans, those are meaningful to fixup.
-        if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
+        if span.anchor.ast_id == self.fixup_id {
             return span;
         }
         Span { range: TextRange::empty(span.range.start()), ..span }

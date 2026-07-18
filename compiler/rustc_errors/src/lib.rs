@@ -5,11 +5,8 @@
 // tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::direct_use_of_rustc_type_ir)]
-#![cfg_attr(bootstrap, feature(assert_matches))]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
 #![feature(default_field_values)]
-#![feature(error_reporter)]
 #![feature(macro_metavar_expr_concat)]
 #![feature(negative_impls)]
 #![feature(never_type)]
@@ -21,14 +18,14 @@ extern crate self as rustc_errors;
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::error::Report;
 use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::Write;
 use std::num::NonZero;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::{fmt, panic};
+use std::thread::ThreadId;
+use std::{assert_matches, fmt, panic};
 
 use Level::*;
 // Used by external projects such as `rust-gpu`.
@@ -40,8 +37,8 @@ pub use anstyle::{
 pub use codes::*;
 pub use decorate_diag::{BufferedEarlyLint, DecorateDiagCompat, LintBuffer};
 pub use diagnostic::{
-    BugAbort, Diag, DiagArgMap, DiagInner, DiagStyledString, Diagnostic, EmissionGuarantee,
-    FatalAbort, LintDiagnostic, LintDiagnosticBox, StringPart, Subdiag, Subdiagnostic,
+    BugAbort, Diag, DiagDecorator, DiagInner, DiagLocation, DiagStyledString, Diagnostic,
+    EmissionGuarantee, FatalAbort, StringPart, Subdiag, Subdiagnostic,
 };
 pub use diagnostic_impls::{
     DiagSymbolList, ElidedLifetimeInPathSubdiag, ExpectedLifetimeParameter,
@@ -49,14 +46,14 @@ pub use diagnostic_impls::{
 };
 pub use emitter::ColorConfig;
 use emitter::{DynEmitter, Emitter};
+use rustc_ast::attr::version::RustcVersion;
+use rustc_data_structures::AtomicRef;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_data_structures::sync::{DynSend, Lock};
-use rustc_data_structures::{AtomicRef, assert_matches};
 pub use rustc_error_messages::{
-    DiagArg, DiagArgFromDisplay, DiagArgName, DiagArgValue, DiagMessage, FluentBundle, IntoDiagArg,
-    LanguageIdentifier, LazyFallbackBundle, MultiSpan, SpanLabel, fallback_fluent_bundle,
-    fluent_bundle, into_diag_arg_using_display,
+    DiagArg, DiagArgFromDisplay, DiagArgMap, DiagArgName, DiagArgValue, DiagMessage, IntoDiagArg,
+    LanguageIdentifier, MultiSpan, SpanLabel, fluent_bundle, into_diag_arg_using_display,
 };
 use rustc_hashes::Hash128;
 use rustc_lint_defs::LintExpectationId;
@@ -70,6 +67,8 @@ use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
 use crate::emitter::TimingEvent;
+use crate::formatting::DiagMessageAddArg;
+pub use crate::formatting::format_diag_message;
 use crate::timings::TimingRecord;
 
 pub mod annotate_snippet_emitter_writer;
@@ -78,12 +77,11 @@ mod decorate_diag;
 mod diagnostic;
 mod diagnostic_impls;
 pub mod emitter;
-pub mod error;
+pub mod formatting;
 pub mod json;
 mod lock;
 pub mod markdown;
 pub mod timings;
-pub mod translation;
 
 pub type PResult<'a, T> = Result<T, Diag<'a>>;
 
@@ -140,6 +138,14 @@ impl Suggestions {
             Suggestions::Enabled(suggestions) => suggestions,
             Suggestions::Sealed(suggestions) => suggestions.into_vec(),
             Suggestions::Disabled => Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Suggestions::Enabled(suggestions) => suggestions.len(),
+            Suggestions::Sealed(suggestions) => suggestions.len(),
+            Suggestions::Disabled => 0,
         }
     }
 }
@@ -292,11 +298,12 @@ impl<'a> std::ops::Deref for DiagCtxtHandle<'a> {
 struct DiagCtxtInner {
     flags: DiagCtxtFlags,
 
-    /// The error guarantees from all emitted errors. The length gives the error count.
-    err_guars: Vec<ErrorGuaranteed>,
-    /// The error guarantee from all emitted lint errors. The length gives the
-    /// lint error count.
-    lint_err_guars: Vec<ErrorGuaranteed>,
+    /// The error guarantees from all emitted errors, each paired with the
+    /// thread that emitted it. The length gives the error count.
+    err_guars: Vec<(ErrorGuaranteed, ThreadId)>,
+    /// The error guarantee from all emitted lint errors, each paired with the
+    /// thread that emitted it. The length gives the lint error count.
+    lint_err_guars: Vec<(ErrorGuaranteed, ThreadId)>,
     /// The delayed bugs and their error guarantees.
     delayed_bugs: Vec<(DelayedDiagInner, ErrorGuaranteed)>,
 
@@ -338,7 +345,7 @@ struct DiagCtxtInner {
     /// `emit_stashed_diagnostics` by the time the `DiagCtxtInner` is dropped,
     /// otherwise an assertion failure will occur.
     stashed_diagnostics:
-        FxIndexMap<StashKey, FxIndexMap<Span, (DiagInner, Option<ErrorGuaranteed>)>>,
+        FxIndexMap<StashKey, FxIndexMap<Span, (DiagInner, Option<ErrorGuaranteed>, ThreadId)>>,
 
     future_breakage_diagnostics: Vec<DiagInner>,
 
@@ -358,6 +365,9 @@ struct DiagCtxtInner {
     /// The file where the ICE information is stored. This allows delayed_span_bug backtraces to be
     /// stored along side the main panic backtrace.
     ice_file: Option<PathBuf>,
+
+    /// Controlled by `-Z hint-msrv`; this allows avoiding emitting lints which would raise MSRV.
+    msrv: Option<RustcVersion>,
 }
 
 /// A key denoting where from a diagnostic was stashed.
@@ -375,8 +385,6 @@ pub enum StashKey {
     MaybeFruTypo,
     CallAssocMethod,
     AssociatedTypeSuggestion,
-    /// Query cycle detected, stashing in favor of a better error.
-    Cycle,
     UndeterminedMacroResolution,
     /// Used by `Parser::maybe_recover_trailing_expr`
     ExprInPat,
@@ -384,6 +392,7 @@ pub enum StashKey {
     /// it's a method call without parens. If later on in `hir_typeck` we find out that this is
     /// the case we suppress this message and we give a better suggestion.
     GenericInFieldExpr,
+    ReturnTypeNotation,
 }
 
 fn default_track_diagnostic<R>(diag: DiagInner, f: &mut dyn FnMut(DiagInner) -> R) -> R {
@@ -473,38 +482,22 @@ impl DiagCtxt {
         self
     }
 
+    pub fn with_msrv(mut self, msrv: RustcVersion) -> Self {
+        self.inner.get_mut().msrv = Some(msrv);
+        self
+    }
+
     pub fn new(emitter: Box<DynEmitter>) -> Self {
         Self { inner: Lock::new(DiagCtxtInner::new(emitter)) }
     }
 
     pub fn make_silent(&self) {
         let mut inner = self.inner.borrow_mut();
-        let translator = inner.emitter.translator().clone();
-        inner.emitter = Box::new(emitter::SilentEmitter { translator });
+        inner.emitter = Box::new(emitter::SilentEmitter {});
     }
 
     pub fn set_emitter(&self, emitter: Box<dyn Emitter + DynSend>) {
         self.inner.borrow_mut().emitter = emitter;
-    }
-
-    /// Translate `message` eagerly with `args` to `DiagMessage::Eager`.
-    pub fn eagerly_translate<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> DiagMessage {
-        let inner = self.inner.borrow();
-        inner.eagerly_translate(message, args)
-    }
-
-    /// Translate `message` eagerly with `args` to `String`.
-    pub fn eagerly_translate_to_string<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> String {
-        let inner = self.inner.borrow();
-        inner.eagerly_translate_to_string(message, args)
     }
 
     // This is here to not allow mutation of flags;
@@ -541,6 +534,7 @@ impl DiagCtxt {
             future_breakage_diagnostics,
             fulfilled_expectations,
             ice_file: _,
+            msrv: _,
         } = inner.deref_mut();
 
         // For the `Vec`s and `HashMap`s, we overwrite with an empty container to free the
@@ -630,7 +624,7 @@ impl<'a> DiagCtxtHandle<'a> {
             .stashed_diagnostics
             .entry(key)
             .or_default()
-            .insert(span.with_parent(None), (diag, guar));
+            .insert(span.with_parent(None), (diag, guar, std::thread::current().id()));
 
         guar
     }
@@ -640,7 +634,7 @@ impl<'a> DiagCtxtHandle<'a> {
     /// error.
     pub fn steal_non_err(self, span: Span, key: StashKey) -> Option<Diag<'a, ()>> {
         // FIXME(#120456) - is `swap_remove` correct?
-        let (diag, guar) = self.inner.borrow_mut().stashed_diagnostics.get_mut(&key).and_then(
+        let (diag, guar, _) = self.inner.borrow_mut().stashed_diagnostics.get_mut(&key).and_then(
             |stashed_diagnostics| stashed_diagnostics.swap_remove(&span.with_parent(None)),
         )?;
         assert!(!diag.is_error());
@@ -665,7 +659,7 @@ impl<'a> DiagCtxtHandle<'a> {
         let err = self.inner.borrow_mut().stashed_diagnostics.get_mut(&key).and_then(
             |stashed_diagnostics| stashed_diagnostics.swap_remove(&span.with_parent(None)),
         );
-        err.map(|(err, guar)| {
+        err.map(|(err, guar, _)| {
             // The use of `::<ErrorGuaranteed>` is safe because level is `Level::Error`.
             assert_eq!(err.level, Error);
             assert!(guar.is_some());
@@ -690,7 +684,7 @@ impl<'a> DiagCtxtHandle<'a> {
             |stashed_diagnostics| stashed_diagnostics.swap_remove(&span.with_parent(None)),
         );
         match old_err {
-            Some((old_err, guar)) => {
+            Some((old_err, guar, _)) => {
                 assert_eq!(old_err.level, Error);
                 assert!(guar.is_some());
                 // Because `old_err` has already been counted, it can only be
@@ -727,7 +721,27 @@ impl<'a> DiagCtxtHandle<'a> {
             + inner
                 .stashed_diagnostics
                 .values()
-                .map(|a| a.values().filter(|(_, guar)| guar.is_some()).count())
+                .map(|a| a.values().filter(|(_, guar, _)| guar.is_some()).count())
+                .sum::<usize>()
+    }
+
+    /// The number of errors that have been emitted on the *current thread*.
+    ///
+    /// Like [`DiagCtxtHandle::err_count`], but only counts errors whose recorded
+    /// emitting thread is the calling thread.
+    pub fn err_count_on_current_thread(&self) -> usize {
+        let inner = self.inner.borrow();
+        let current = std::thread::current().id();
+        inner.err_guars.iter().filter(|(_, thread)| *thread == current).count()
+            + inner.lint_err_guars.iter().filter(|(_, thread)| *thread == current).count()
+            + inner
+                .stashed_diagnostics
+                .values()
+                .map(|a| {
+                    a.values()
+                        .filter(|(_, guar, thread)| guar.is_some() && *thread == current)
+                        .count()
+                })
                 .sum::<usize>()
     }
 
@@ -896,7 +910,8 @@ impl<'a> DiagCtxtHandle<'a> {
             // This `unchecked_error_guaranteed` is valid. It is where the
             // `ErrorGuaranteed` for unused_extern errors originates.
             #[allow(deprecated)]
-            inner.lint_err_guars.push(ErrorGuaranteed::unchecked_error_guaranteed());
+            let guar = ErrorGuaranteed::unchecked_error_guaranteed();
+            inner.lint_err_guars.push((guar, std::thread::current().id()));
             inner.panic_if_treat_err_as_bug();
         }
 
@@ -1187,6 +1202,7 @@ impl DiagCtxtInner {
             future_breakage_diagnostics: Vec::new(),
             fulfilled_expectations: Default::default(),
             ice_file: None,
+            msrv: None,
         }
     }
 
@@ -1195,7 +1211,7 @@ impl DiagCtxtInner {
         let mut guar = None;
         let has_errors = !self.err_guars.is_empty();
         for (_, stashed_diagnostics) in std::mem::take(&mut self.stashed_diagnostics).into_iter() {
-            for (_, (diag, _guar)) in stashed_diagnostics {
+            for (_, (diag, _guar, _thread)) in stashed_diagnostics {
                 if !diag.is_error() {
                     // Unless they're forced, don't flush stashed warnings when
                     // there are errors, to avoid causing warning overload. The
@@ -1301,6 +1317,12 @@ impl DiagCtxtInner {
             }
         }
 
+        if let (Some(msrv), Some(diag_msrv)) = (self.msrv, diagnostic.rust_version())
+            && diag_msrv > msrv
+        {
+            return None;
+        }
+
         TRACK_DIAGNOSTIC(diagnostic, &mut |mut diagnostic| {
             if let Some(code) = diagnostic.code {
                 self.emitted_diagnostic_codes.insert(code);
@@ -1364,13 +1386,14 @@ impl DiagCtxtInner {
                 // `ErrorGuaranteed` for errors and lint errors originates.
                 #[allow(deprecated)]
                 let guar = ErrorGuaranteed::unchecked_error_guaranteed();
+                let thread = std::thread::current().id();
                 if is_lint {
-                    self.lint_err_guars.push(guar);
+                    self.lint_err_guars.push((guar, thread));
                 } else {
                     if let Some(taint) = taint {
                         taint.set(Some(guar));
                     }
-                    self.err_guars.push(guar);
+                    self.err_guars.push((guar, thread));
                 }
                 self.panic_if_treat_err_as_bug();
                 Some(guar)
@@ -1394,12 +1417,12 @@ impl DiagCtxtInner {
     }
 
     fn has_errors_excluding_lint_errors(&self) -> Option<ErrorGuaranteed> {
-        self.err_guars.get(0).copied().or_else(|| {
-            if let Some((_diag, guar)) = self
+        self.err_guars.get(0).map(|(guar, _)| *guar).or_else(|| {
+            if let Some((_diag, guar, _)) = self
                 .stashed_diagnostics
                 .values()
                 .flat_map(|stashed_diagnostics| stashed_diagnostics.values())
-                .find(|(diag, guar)| guar.is_some() && diag.is_lint.is_none())
+                .find(|(diag, guar, _)| guar.is_some() && diag.is_lint.is_none())
             {
                 *guar
             } else {
@@ -1409,49 +1432,19 @@ impl DiagCtxtInner {
     }
 
     fn has_errors(&self) -> Option<ErrorGuaranteed> {
-        self.err_guars.get(0).copied().or_else(|| self.lint_err_guars.get(0).copied()).or_else(
-            || {
+        self.err_guars
+            .get(0)
+            .map(|(guar, _)| *guar)
+            .or_else(|| self.lint_err_guars.get(0).map(|(guar, _)| *guar))
+            .or_else(|| {
                 self.stashed_diagnostics.values().find_map(|stashed_diagnostics| {
-                    stashed_diagnostics.values().find_map(|(_, guar)| *guar)
+                    stashed_diagnostics.values().find_map(|(_, guar, _)| *guar)
                 })
-            },
-        )
+            })
     }
 
     fn has_errors_or_delayed_bugs(&self) -> Option<ErrorGuaranteed> {
         self.has_errors().or_else(|| self.delayed_bugs.get(0).map(|(_, guar)| guar).copied())
-    }
-
-    /// Translate `message` eagerly with `args` to `DiagMessage::Eager`.
-    fn eagerly_translate<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> DiagMessage {
-        DiagMessage::Str(Cow::from(self.eagerly_translate_to_string(message, args)))
-    }
-
-    /// Translate `message` eagerly with `args` to `String`.
-    fn eagerly_translate_to_string<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> String {
-        let args = crate::translation::to_fluent_args(args);
-        self.emitter
-            .translator()
-            .translate_message(&message, &args)
-            .map_err(Report::new)
-            .unwrap()
-            .to_string()
-    }
-
-    fn eagerly_translate_for_subdiag(
-        &self,
-        diag: &DiagInner,
-        msg: impl Into<DiagMessage>,
-    ) -> DiagMessage {
-        self.eagerly_translate(msg.into(), diag.args.iter())
     }
 
     fn flush_delayed(&mut self) {
@@ -1503,7 +1496,7 @@ impl DiagCtxtInner {
                 );
             }
 
-            let mut bug = if decorate { bug.decorate(self) } else { bug.inner };
+            let mut bug = if decorate { bug.decorate() } else { bug.inner };
 
             // "Undelay" the delayed bugs into plain bugs.
             if bug.level != DelayedBug {
@@ -1513,11 +1506,9 @@ impl DiagCtxtInner {
                 // We are at the `DiagInner`/`DiagCtxtInner` level rather than
                 // the usual `Diag`/`DiagCtxt` level, so we must augment `bug`
                 // in a lower-level fashion.
-                bug.arg("level", bug.level);
                 let msg = msg!(
                     "`flushed_delayed` got diagnostic with level {$level}, instead of the expected `DelayedBug`"
-                );
-                let msg = self.eagerly_translate_for_subdiag(&bug, msg); // after the `arg` call
+                ).arg("level", bug.level).format();
                 bug.sub(Note, msg, bug.span.primary_span().unwrap().into());
             }
             bug.level = Bug;
@@ -1552,7 +1543,7 @@ impl DelayedDiagInner {
         DelayedDiagInner { inner: diagnostic, note: backtrace }
     }
 
-    fn decorate(self, dcx: &DiagCtxtInner) -> DiagInner {
+    fn decorate(self) -> DiagInner {
         // We are at the `DiagInner`/`DiagCtxtInner` level rather than the
         // usual `Diag`/`DiagCtxt` level, so we must construct `diag` in a
         // lower-level fashion.
@@ -1565,10 +1556,10 @@ impl DelayedDiagInner {
             // Avoid the needless newline when no backtrace has been captured,
             // the display impl should just be a single line.
             _ => msg!("delayed at {$emitted_at} - {$note}"),
-        };
-        diag.arg("emitted_at", diag.emitted_at.clone());
-        diag.arg("note", self.note);
-        let msg = dcx.eagerly_translate_for_subdiag(&diag, msg); // after the `arg` calls
+        }
+        .arg("emitted_at", diag.emitted_at.clone())
+        .arg("note", self.note)
+        .format();
         diag.sub(Note, msg, diag.span.primary_span().unwrap_or(DUMMY_SP).into());
         diag
     }
